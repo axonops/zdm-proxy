@@ -1014,8 +1014,15 @@ func (ch *ClientHandler) processPreparedResponse(
 		return nil, errors.New("unexpected statement info nil on request context")
 	} else if prepareRequestInfo, ok := reqCtx.requestInfo.(*PrepareRequestInfo); !ok {
 		return nil, errors.New("unexpected request context statement info is not prepared statement info")
-	} else if reqCtx.targetResponse == nil {
+	} else if reqCtx.targetResponse == nil && ch.targetEnabled.Load() {
 		return nil, errors.New("unexpected target response nil")
+	} else if reqCtx.targetResponse == nil {
+		// Target is disabled — store with origin ID as both origin and target.
+		// When target is re-enabled, EXECUTE will trigger UNPREPARED on target,
+		// and the client driver will re-prepare, populating the cache properly.
+		log.Debugf("Target disabled: caching PREPARE with origin ID only (query: %s)", prepareRequestInfo.GetQuery())
+		ch.preparedStatementCache.Store(bodyMsg, bodyMsg, prepareRequestInfo)
+		return response, nil
 	} else {
 		targetBody, err := ch.getCodec().DecodeBody(reqCtx.targetResponse.Header, bytes.NewReader(reqCtx.targetResponse.Body))
 		if err != nil {
@@ -1554,8 +1561,9 @@ func (ch *ClientHandler) executeRequest(
 	// When target is disabled, nothing goes to target.
 	if !ch.targetEnabled.Load() {
 		if fwdDecision == forwardToBoth || fwdDecision == forwardToTarget {
+			log.Debugf("Target disabled: overriding %v to forwardToOrigin for opcode %v stream %d",
+				fwdDecision, frameContext.GetRawFrame().Header.OpCode, frameContext.GetRawFrame().Header.StreamId)
 			fwdDecision = forwardToOrigin
-			log.Tracef("Target disabled, redirecting to origin for opcode %v", frameContext.GetRawFrame().Header.OpCode)
 		}
 	}
 
