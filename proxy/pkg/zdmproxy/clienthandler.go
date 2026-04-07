@@ -1529,8 +1529,10 @@ func (ch *ClientHandler) executeRequest(
 	overallRequestStartTime time.Time, customResponseChannel chan *customResponse, requestTimeout time.Duration) error {
 	fwdDecision := requestInfo.GetForwardDecision()
 
-	// When target is disabled, nothing goes to target.
-	if !ch.targetEnabled.Load() {
+	// When target is disabled, nothing goes to target — but only after handshake
+	// is complete. Handshake requests (STARTUP, AUTH) must go to both clusters
+	// so the target ClusterConnector can establish its connection.
+	if ch.handshakeDone.Load() != nil && !ch.targetEnabled.Load() {
 		if fwdDecision == forwardToBoth || fwdDecision == forwardToTarget {
 			fwdDecision = forwardToOrigin
 			log.Tracef("Target disabled, redirecting to origin for opcode %v", frameContext.GetRawFrame().Header.OpCode)
