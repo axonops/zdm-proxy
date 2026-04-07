@@ -242,15 +242,20 @@ func NewClientHandler(
 		return nil, err
 	}
 
-	targetConnector, err := NewClusterConnector(
-		targetCassandraConnInfo, conf, psCache, nodeMetrics, localClientHandlerWg, clientHandlerRequestWg,
-		clientHandlerContext, clientHandlerCancelFunc, respChannel, readScheduler, writeScheduler, requestsDoneCtx,
-		false, nil, handshakeDone, targetFrameProcessor, targetCCProtoVer,
-		compression)
-	if err != nil {
-		metricHandler.GetProxyMetrics().FailedConnectionsTarget.Add(1)
-		clientHandlerCancelFunc()
-		return nil, err
+	var targetConnector *ClusterConnector
+	if targetEnabled.Load() {
+		targetConnector, err = NewClusterConnector(
+			targetCassandraConnInfo, conf, psCache, nodeMetrics, localClientHandlerWg, clientHandlerRequestWg,
+			clientHandlerContext, clientHandlerCancelFunc, respChannel, readScheduler, writeScheduler, requestsDoneCtx,
+			false, nil, handshakeDone, targetFrameProcessor, targetCCProtoVer,
+			compression)
+		if err != nil {
+			metricHandler.GetProxyMetrics().FailedConnectionsTarget.Add(1)
+			clientHandlerCancelFunc()
+			return nil, err
+		}
+	} else {
+		log.Debugf("Target disabled, skipping target cluster connector creation")
 	}
 
 	asyncPendingRequests := newPendingRequests(nodeMetrics)
@@ -373,7 +378,9 @@ func NewClientHandler(
 func (ch *ClientHandler) run(activeClients *int32) {
 	ch.clientConnector.run(activeClients)
 	ch.originCassandraConnector.run()
-	ch.targetCassandraConnector.run()
+	if ch.targetCassandraConnector != nil {
+		ch.targetCassandraConnector.run()
+	}
 	if ch.asyncConnector != nil {
 		ch.asyncConnector.run()
 	}
@@ -382,11 +389,15 @@ func (ch *ClientHandler) run(activeClients *int32) {
 	ch.responseLoop()
 
 	addObserver(ch.originObserver, ch.originControlConn)
-	addObserver(ch.targetObserver, ch.targetControlConn)
+	if ch.targetCassandraConnector != nil {
+		addObserver(ch.targetObserver, ch.targetControlConn)
+	}
 
 	go func() {
 		<-ch.originCassandraConnector.doneChan
-		<-ch.targetCassandraConnector.doneChan
+		if ch.targetCassandraConnector != nil {
+			<-ch.targetCassandraConnector.doneChan
+		}
 		if ch.asyncConnector != nil {
 			<-ch.asyncConnector.doneChan
 		}
@@ -396,7 +407,9 @@ func (ch *ClientHandler) run(activeClients *int32) {
 		ch.closedRespChannel = true
 
 		removeObserver(ch.originObserver, ch.originControlConn)
-		removeObserver(ch.targetObserver, ch.targetControlConn)
+		if ch.targetCassandraConnector != nil {
+			removeObserver(ch.targetObserver, ch.targetControlConn)
+		}
 	}()
 }
 
@@ -433,8 +446,10 @@ func (ch *ClientHandler) requestLoop() {
 		defer ch.requestsDoneCancelFn()
 		defer ch.originCassandraConnector.writeCoalescer.Close()
 		defer log.Debugf("Waiting for origin write coalescer to finish...")
-		defer ch.targetCassandraConnector.writeCoalescer.Close()
-		defer log.Debugf("Waiting for target write coalescer to finish...")
+		if ch.targetCassandraConnector != nil {
+			defer ch.targetCassandraConnector.writeCoalescer.Close()
+			defer log.Debugf("Waiting for target write coalescer to finish...")
+		}
 		if ch.asyncConnector != nil {
 			defer ch.asyncConnector.writeCoalescer.Close()
 			defer log.Debugf("Waiting for async %s write coalescer to finish...", ch.asyncConnector.clusterType)
@@ -535,7 +550,12 @@ func (ch *ClientHandler) listenForEventMessages() {
 		defer ch.localClientHandlerWg.Done()
 		defer close(ch.eventsDoneChan)
 		shutDownChannels := 0
-		targetChannel := ch.targetCassandraConnector.clusterConnEventsChan
+		var targetChannel chan *frame.RawFrame
+		if ch.targetCassandraConnector != nil {
+			targetChannel = ch.targetCassandraConnector.clusterConnEventsChan
+		} else {
+			shutDownChannels++ // no target connector, count as already shut down
+		}
 		originChannel := ch.originCassandraConnector.clusterConnEventsChan
 		for {
 			if shutDownChannels >= 2 {
@@ -643,7 +663,9 @@ func (ch *ClientHandler) responseLoop() {
 				case ClusterConnectorTypeOrigin:
 					responseClusterType = ch.originCassandraConnector.clusterType
 				case ClusterConnectorTypeTarget:
-					responseClusterType = ch.targetCassandraConnector.clusterType
+					if ch.targetCassandraConnector != nil {
+						responseClusterType = ch.targetCassandraConnector.clusterType
+					}
 				}
 
 				if response.connectorType != ClusterConnectorTypeAsync {
@@ -1529,10 +1551,8 @@ func (ch *ClientHandler) executeRequest(
 	overallRequestStartTime time.Time, customResponseChannel chan *customResponse, requestTimeout time.Duration) error {
 	fwdDecision := requestInfo.GetForwardDecision()
 
-	// When target is disabled, nothing goes to target — but only after handshake
-	// is complete. Handshake requests (STARTUP, AUTH) must go to both clusters
-	// so the target ClusterConnector can establish its connection.
-	if ch.handshakeDone.Load() != nil && !ch.targetEnabled.Load() {
+	// When target is disabled, nothing goes to target.
+	if !ch.targetEnabled.Load() {
 		if fwdDecision == forwardToBoth || fwdDecision == forwardToTarget {
 			fwdDecision = forwardToOrigin
 			log.Tracef("Target disabled, redirecting to origin for opcode %v", frameContext.GetRawFrame().Header.OpCode)

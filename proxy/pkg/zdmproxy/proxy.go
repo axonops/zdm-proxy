@@ -552,24 +552,27 @@ func (p *ZdmProxy) handleNewConnection(clientConn net.Conn) {
 
 	var targetEndpoint Endpoint
 	var targetHost *Host
-	if p.Conf.TargetEnableHostAssignment {
-		targetHost, err = p.targetControlConn.NextAssignedHost()
-		if err != nil {
-			errFunc(err)
-			return
+	var targetCassandraConnInfo *ClusterConnectionInfo
+	if p.targetEnabled.Load() {
+		if p.Conf.TargetEnableHostAssignment {
+			targetHost, err = p.targetControlConn.NextAssignedHost()
+			if err != nil {
+				errFunc(err)
+				return
+			}
+			targetEndpoint = p.targetConnectionConfig.CreateEndpoint(targetHost)
+		} else {
+			targetEndpoint = p.targetControlConn.GetCurrentContactPoint()
+			if targetEndpoint == nil {
+				log.Warnf("Target ControlConnection current endpoint is nil, "+
+					"falling back to first target contact point (%v) for client connection %v.",
+					p.targetConnectionConfig.GetContactPoints()[0].String(), clientConn.RemoteAddr().String())
+			}
 		}
-		targetEndpoint = p.targetConnectionConfig.CreateEndpoint(targetHost)
-	} else {
-		targetEndpoint = p.targetControlConn.GetCurrentContactPoint()
-		if targetEndpoint == nil {
-			log.Warnf("Target ControlConnection current endpoint is nil, "+
-				"falling back to first target contact point (%v) for client connection %v.",
-				p.targetConnectionConfig.GetContactPoints()[0].String(), clientConn.RemoteAddr().String())
-		}
+		targetCassandraConnInfo = NewClusterConnectionInfo(p.targetConnectionConfig, targetEndpoint, false)
 	}
 
 	originCassandraConnInfo := NewClusterConnectionInfo(p.originConnectionConfig, originEndpoint, true)
-	targetCassandraConnInfo := NewClusterConnectionInfo(p.targetConnectionConfig, targetEndpoint, false)
 	clientHandler, err := NewClientHandler(
 		clientConn,
 		originCassandraConnInfo,
