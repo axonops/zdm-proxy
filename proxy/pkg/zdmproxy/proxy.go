@@ -94,7 +94,7 @@ func NewZdmProxy(conf *config.Config) (*ZdmProxy, error) {
 	targetEnabled := &atomic.Bool{}
 	targetEnabled.Store(true)
 	zdmProxy := &ZdmProxy{
-		Conf:                conf,
+		Conf:          conf,
 		targetEnabled: targetEnabled,
 	}
 	err := zdmProxy.initializeGlobalStructures()

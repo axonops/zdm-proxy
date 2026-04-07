@@ -362,8 +362,8 @@ func NewClientHandler(
 		clientHandlerShutdownRequestCancelFn: clientHandlerShutdownRequestCancelFn,
 		clientHandlerShutdownRequestContext:  clientHandlerShutdownRequestContext,
 		compression:                          compression,
-		targetConsistencyLevel:          targetWriteCL,
-		targetEnabled:             targetEnabled,
+		targetConsistencyLevel:               targetWriteCL,
+		targetEnabled:                        targetEnabled,
 	}, nil
 }
 
