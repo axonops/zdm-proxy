@@ -19,6 +19,7 @@ import (
 	"github.com/datastax/zdm-proxy/integration-tests/setup"
 	"github.com/datastax/zdm-proxy/integration-tests/utils"
 	"github.com/datastax/zdm-proxy/proxy/pkg/httpzdmproxy"
+	"github.com/datastax/zdm-proxy/proxy/pkg/zdmproxy"
 )
 
 const toggleTable = "toggle_test_data"
@@ -31,23 +32,14 @@ const toggleLoadTable = "toggle_test_load"
 const toggleHTTPAddr = "localhost:14098"
 
 // startToggleHTTPServer creates a dedicated HTTP server for metrics and target toggle API.
-func startToggleHTTPServer(t *testing.T, proxyInstance interface {
-	GetMetricHandler() interface{ GetHttpHandler() http.Handler }
-	SetTargetEnabled(bool)
-	IsTargetEnabled() bool
-}) *http.Server {
+func startToggleHTTPServer(t *testing.T, proxyInstance *zdmproxy.ZdmProxy) *http.Server {
 	t.Helper()
-
-	type fullProxy interface {
-		GetMetricHandler() interface{ GetHttpHandler() http.Handler }
-		httpzdmproxy.TargetToggle
-	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", proxyInstance.GetMetricHandler().GetHttpHandler())
-	mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
-	mux.Handle("/api/v1/target/enable", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
-	mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
+	mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance))
+	mux.Handle("/api/v1/target/enable", httpzdmproxy.TargetHandler(proxyInstance))
+	mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance))
 	srv := &http.Server{Addr: toggleHTTPAddr, Handler: mux}
 	go func() {
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
