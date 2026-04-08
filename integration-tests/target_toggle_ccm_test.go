@@ -7,16 +7,18 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	gocql "github.com/apache/cassandra-gocql-driver/v2"
+	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/datastax/zdm-proxy/integration-tests/setup"
 	"github.com/datastax/zdm-proxy/integration-tests/utils"
 	"github.com/datastax/zdm-proxy/proxy/pkg/httpzdmproxy"
-	log "github.com/sirupsen/logrus"
 )
 
 const toggleTable = "toggle_test_data"
@@ -24,38 +26,35 @@ const toggleCounterTable = "toggle_test_counters"
 const toggleBatchA = "toggle_test_batch_a"
 const toggleBatchB = "toggle_test_batch_b"
 const togglePreparedTable = "toggle_test_prepared"
+const toggleLoadTable = "toggle_test_load"
 
 const toggleHTTPAddr = "localhost:14098"
 
-// TestTargetToggleCCM tests the full lifecycle of disabling and re-enabling the target cluster
-// at runtime via the REST API.
-//
-// Phases:
-//  1. Write broad set (inline, prepared, batch, counter) with target enabled → verify metrics on both clusters.
-//  2. Disable target via API → write same broad set → verify only origin metrics increment.
-//  3. While disabled, create NEW prepared statements (these only go to origin).
-//  4. Re-enable target via API → use those new prepared statements → verify they work
-//     (UNPREPARED recovery re-prepares them on target) → verify both metrics resume.
-func TestTargetToggleCCM(t *testing.T) {
-	proxyInstance, err := NewProxyInstanceForGlobalCcmClusters(t)
-	require.Nil(t, err)
-	defer proxyInstance.Shutdown()
+// startToggleHTTPServer creates a dedicated HTTP server for metrics and target toggle API.
+func startToggleHTTPServer(t *testing.T, proxyInstance interface {
+	GetMetricHandler() interface{ GetHttpHandler() http.Handler }
+	SetTargetEnabled(bool)
+	IsTargetEnabled() bool
+}) *http.Server {
+	t.Helper()
 
-	// Start a dedicated HTTP server for metrics and target toggle API
+	type fullProxy interface {
+		GetMetricHandler() interface{ GetHttpHandler() http.Handler }
+		httpzdmproxy.TargetToggle
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", proxyInstance.GetMetricHandler().GetHttpHandler())
-	mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance))
-	mux.Handle("/api/v1/target/enable", httpzdmproxy.TargetHandler(proxyInstance))
-	mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance))
+	mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
+	mux.Handle("/api/v1/target/enable", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
+	mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance.(httpzdmproxy.TargetToggle)))
 	srv := &http.Server{Addr: toggleHTTPAddr, Handler: mux}
 	go func() {
 		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
 			log.Warnf("toggle test http server error: %v", err)
 		}
 	}()
-	defer srv.Close()
 
-	// Wait for HTTP server to be ready
 	require.Eventually(t, func() bool {
 		resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/target", toggleHTTPAddr))
 		if err != nil {
@@ -65,25 +64,48 @@ func TestTargetToggleCCM(t *testing.T) {
 		return resp.StatusCode == http.StatusOK
 	}, 5*time.Second, 100*time.Millisecond, "HTTP server did not start")
 
+	return srv
+}
+
+// createToggleTables creates the test tables on a given session.
+func createToggleTables(t *testing.T, s *gocql.Session) {
+	t.Helper()
+	tables := []string{toggleTable, toggleBatchA, toggleBatchB, togglePreparedTable, toggleLoadTable}
+	for _, tbl := range tables {
+		s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", setup.TestKeyspace, tbl)).Exec()
+		require.Nil(t, s.Query(fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, name text)", setup.TestKeyspace, tbl)).Exec())
+	}
+	s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", setup.TestKeyspace, toggleCounterTable)).Exec()
+	require.Nil(t, s.Query(fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, count counter)", setup.TestKeyspace, toggleCounterTable)).Exec())
+}
+
+// TestTargetToggleCCM tests the full lifecycle of disabling and re-enabling the target cluster
+// at runtime via the REST API.
+//
+// Phases:
+//  1. Write broad set (inline, prepared, batch, counter) with target enabled -> verify metrics on both clusters.
+//  2. Disable target via API -> write same broad set -> verify only origin metrics increment.
+//  3. While disabled, create NEW prepared statements (these only go to origin).
+//  4. Re-enable target via API -> use those new prepared statements -> verify they work
+//     (UNPREPARED recovery re-prepares them on target) -> verify both metrics resume.
+//  5. Verify reads work throughout (SELECT on origin while target disabled).
+//  6. Multiple rapid toggle cycles to check stability.
+func TestTargetToggleCCM(t *testing.T) {
+	proxyInstance, err := NewProxyInstanceForGlobalCcmClusters(t)
+	require.Nil(t, err)
+	defer proxyInstance.Shutdown()
+
+	srv := startToggleHTTPServer(t, proxyInstance)
+	defer srv.Close()
+
 	originCluster, targetCluster, err := SetupOrGetGlobalCcmClusters(t)
 	require.Nil(t, err)
 
-	// Create test tables on both clusters
-	createToggleTables := func(s *gocql.Session) {
-		tables := []string{toggleTable, toggleBatchA, toggleBatchB, togglePreparedTable}
-		for _, tbl := range tables {
-			s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", setup.TestKeyspace, tbl)).Exec()
-			require.Nil(t, s.Query(fmt.Sprintf(
-				"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, name text)", setup.TestKeyspace, tbl)).Exec())
-		}
-		s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", setup.TestKeyspace, toggleCounterTable)).Exec()
-		require.Nil(t, s.Query(fmt.Sprintf(
-			"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, count counter)", setup.TestKeyspace, toggleCounterTable)).Exec())
-	}
-	createToggleTables(originCluster.GetSession())
-	createToggleTables(targetCluster.GetSession())
+	createToggleTables(t, originCluster.GetSession())
+	createToggleTables(t, targetCluster.GetSession())
 
-	// Connect to proxy
 	proxy, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
 	require.Nil(t, err)
 	defer proxy.Close()
@@ -100,6 +122,16 @@ func TestTargetToggleCCM(t *testing.T) {
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"INSERT INTO %s.%s (id, name) VALUES (a0000001-0000-0000-0000-000000000001, 'p1_inline')", ks, toggleTable)).Exec())
 
+		// Inline UPDATE
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"UPDATE %s.%s SET name = 'p1_inline_updated' WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleTable)).Exec())
+
+		// Inline DELETE + re-insert
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"DELETE FROM %s.%s WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleTable)).Exec())
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (a0000001-0000-0000-0000-000000000001, 'p1_inline')", ks, toggleTable)).Exec())
+
 		// Inline counter
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"UPDATE %s.%s SET count = count + 1 WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleCounterTable)).Exec())
@@ -108,6 +140,26 @@ func TestTargetToggleCCM(t *testing.T) {
 		q := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleTable))
 		q.Bind("a0000001-0000-0000-0000-000000000002", "p1_prepared")
 		require.Nil(t, q.Exec())
+
+		// Prepared UPDATE
+		q2 := proxy.Query(fmt.Sprintf("UPDATE %s.%s SET name = ? WHERE id = ?", ks, toggleTable))
+		q2.Bind("p1_prepared_updated", "a0000001-0000-0000-0000-000000000002")
+		require.Nil(t, q2.Exec())
+
+		// Prepared DELETE
+		q3 := proxy.Query(fmt.Sprintf("DELETE FROM %s.%s WHERE id = ?", ks, toggleTable))
+		q3.Bind("a0000001-0000-0000-0000-000000000002")
+		require.Nil(t, q3.Exec())
+
+		// Re-insert for later verification
+		q4 := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleTable))
+		q4.Bind("a0000001-0000-0000-0000-000000000002", "p1_prepared")
+		require.Nil(t, q4.Exec())
+
+		// Prepared counter
+		qc := proxy.Query(fmt.Sprintf("UPDATE %s.%s SET count = count + ? WHERE id = ?", ks, toggleCounterTable))
+		qc.Bind(int64(5), "a0000001-0000-0000-0000-000000000002")
+		require.Nil(t, qc.Exec())
 
 		// Batch with inline children
 		batch := proxy.NewBatch(gocql.LoggedBatch)
@@ -121,16 +173,37 @@ func TestTargetToggleCCM(t *testing.T) {
 		batch2.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchB), "a0000001-0000-0000-0000-000000000004", "p1_batch_prep_b")
 		require.Nil(t, proxy.ExecuteBatch(batch2))
 
+		// Batch with mixed inline and prepared children
+		batch3 := proxy.NewBatch(gocql.LoggedBatch)
+		batch3.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (a0000001-0000-0000-0000-000000000005, 'p1_mixed_inline')", ks, toggleBatchA))
+		batch3.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchB), "a0000001-0000-0000-0000-000000000005", "p1_mixed_prepared")
+		require.Nil(t, proxy.ExecuteBatch(batch3))
+
+		// Counter batch
+		counterBatch := proxy.NewBatch(gocql.CounterBatch)
+		counterBatch.Query(fmt.Sprintf("UPDATE %s.%s SET count = count + 1 WHERE id = a0000001-0000-0000-0000-000000000003", ks, toggleCounterTable))
+		require.Nil(t, proxy.ExecuteBatch(counterBatch))
+
 		// Verify metrics on both clusters
 		lines := gatherToggleMetricLines(t)
 		requireMetricPresent(t, lines, "proxy_write_success_total", "origin", ks, toggleTable)
 		requireMetricPresent(t, lines, "proxy_write_success_total", "target", ks, toggleTable)
 		requireMetricPresent(t, lines, "proxy_write_success_total", "origin", ks, toggleBatchA)
 		requireMetricPresent(t, lines, "proxy_write_success_total", "target", ks, toggleBatchA)
+		requireMetricPresent(t, lines, "proxy_write_success_total", "origin", ks, toggleBatchB)
+		requireMetricPresent(t, lines, "proxy_write_success_total", "target", ks, toggleBatchB)
+		requireMetricPresent(t, lines, "proxy_write_success_total", "origin", ks, toggleCounterTable)
+		requireMetricPresent(t, lines, "proxy_write_success_total", "target", ks, toggleCounterTable)
 
 		// Verify data exists on target
 		var name string
 		err := targetCluster.GetSession().Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleTable)).Scan(&name)
+		require.Nil(t, err)
+		require.Equal(t, "p1_inline", name)
+
+		// Verify SELECT works through proxy
+		err = proxy.Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleTable)).Scan(&name)
 		require.Nil(t, err)
 		require.Equal(t, "p1_inline", name)
@@ -146,11 +219,22 @@ func TestTargetToggleCCM(t *testing.T) {
 	// PHASE 2: Disable target — writes go to origin only
 	// ================================================================
 	t.Run("phase2_target_disabled", func(t *testing.T) {
-		// Disable target via API
 		postTargetToggle(t, "disable")
 		requireTargetStatus(t, false)
 
-		// Inline INSERT — should succeed (origin only)
+		// Inline INSERT
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (b0000001-0000-0000-0000-000000000001, 'p2_inline')", ks, toggleTable)).Exec())
+
+		// Inline UPDATE
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"UPDATE %s.%s SET name = 'p2_inline_updated' WHERE id = b0000001-0000-0000-0000-000000000001", ks, toggleTable)).Exec())
+
+		// Inline DELETE
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"DELETE FROM %s.%s WHERE id = b0000001-0000-0000-0000-000000000001", ks, toggleTable)).Exec())
+
+		// Re-insert for verification
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"INSERT INTO %s.%s (id, name) VALUES (b0000001-0000-0000-0000-000000000001, 'p2_inline')", ks, toggleTable)).Exec())
 
@@ -158,10 +242,20 @@ func TestTargetToggleCCM(t *testing.T) {
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"UPDATE %s.%s SET count = count + 1 WHERE id = b0000001-0000-0000-0000-000000000001", ks, toggleCounterTable)).Exec())
 
-		// Prepared INSERT (re-using existing prepared statement)
+		// Prepared INSERT
 		q := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleTable))
 		q.Bind("b0000001-0000-0000-0000-000000000002", "p2_prepared")
 		require.Nil(t, q.Exec())
+
+		// Prepared UPDATE
+		q2 := proxy.Query(fmt.Sprintf("UPDATE %s.%s SET name = ? WHERE id = ?", ks, toggleTable))
+		q2.Bind("p2_prepared_updated", "b0000001-0000-0000-0000-000000000002")
+		require.Nil(t, q2.Exec())
+
+		// Prepared DELETE
+		q3 := proxy.Query(fmt.Sprintf("DELETE FROM %s.%s WHERE id = ?", ks, toggleTable))
+		q3.Bind("b0000001-0000-0000-0000-000000000002")
+		require.Nil(t, q3.Exec())
 
 		// Batch with inline children
 		batch := proxy.NewBatch(gocql.LoggedBatch)
@@ -175,6 +269,11 @@ func TestTargetToggleCCM(t *testing.T) {
 		batch2.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchB), "b0000001-0000-0000-0000-000000000004", "p2_batch_prep_b")
 		require.Nil(t, proxy.ExecuteBatch(batch2))
 
+		// Counter batch
+		counterBatch := proxy.NewBatch(gocql.CounterBatch)
+		counterBatch.Query(fmt.Sprintf("UPDATE %s.%s SET count = count + 1 WHERE id = b0000001-0000-0000-0000-000000000003", ks, toggleCounterTable))
+		require.Nil(t, proxy.ExecuteBatch(counterBatch))
+
 		// Verify: origin metrics increased, target metrics did NOT
 		originCountAfter := getMetricValue(t, ks, toggleTable, "origin")
 		targetCountAfter := getMetricValue(t, ks, toggleTable, "target")
@@ -183,13 +282,11 @@ func TestTargetToggleCCM(t *testing.T) {
 		require.Equal(t, targetCountBefore, targetCountAfter,
 			"target write count should NOT have changed: before=%v after=%v", targetCountBefore, targetCountAfter)
 
-		// Verify data NOT on target (written during disabled period)
-		var count int
+		// Verify data NOT on target
 		iter := targetCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = b0000001-0000-0000-0000-000000000001", ks, toggleTable)).Iter()
-		count = iter.NumRows()
+		require.Equal(t, 0, iter.NumRows(), "data written during disabled period should NOT be on target")
 		iter.Close()
-		require.Equal(t, 0, count, "data written during disabled period should NOT be on target")
 
 		// Verify data IS on origin
 		var name string
@@ -197,53 +294,73 @@ func TestTargetToggleCCM(t *testing.T) {
 			"SELECT name FROM %s.%s WHERE id = b0000001-0000-0000-0000-000000000001", ks, toggleTable)).Scan(&name)
 		require.Nil(t, err)
 		require.Equal(t, "p2_inline", name)
+
+		// Verify SELECT still works through proxy while target disabled
+		err = proxy.Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = a0000001-0000-0000-0000-000000000001", ks, toggleTable)).Scan(&name)
+		require.Nil(t, err)
+		require.Equal(t, "p1_inline", name)
+
+		// Verify gauge shows disabled
+		lines := gatherToggleMetricLines(t)
+		requireTargetEnabledGauge(t, lines, 0)
 	})
 
 	// ================================================================
 	// PHASE 3: While disabled, create NEW prepared statements
-	// These will only be prepared on origin, NOT on target.
 	// ================================================================
 	t.Run("phase3_new_prepared_while_disabled", func(t *testing.T) {
 		requireTargetStatus(t, false)
 
-		// Prepare and execute a NEW statement on a different table
-		// gocql auto-prepares when bind params are used
+		// New prepared INSERT on a table not previously used with prepared statements
 		q := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, togglePreparedTable))
 		q.Bind("c0000001-0000-0000-0000-000000000001", "p3_new_prepared")
 		require.Nil(t, q.Exec())
 
-		// Also create a prepared UPDATE
+		// New prepared UPDATE
 		q2 := proxy.Query(fmt.Sprintf("UPDATE %s.%s SET name = ? WHERE id = ?", ks, togglePreparedTable))
 		q2.Bind("p3_updated", "c0000001-0000-0000-0000-000000000001")
 		require.Nil(t, q2.Exec())
+
+		// New prepared DELETE
+		q3 := proxy.Query(fmt.Sprintf("DELETE FROM %s.%s WHERE id = ?", ks, togglePreparedTable))
+		q3.Bind("c0000001-0000-0000-0000-000000000001")
+		require.Nil(t, q3.Exec())
+
+		// Re-insert for later use in phase 4
+		q4 := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, togglePreparedTable))
+		q4.Bind("c0000001-0000-0000-0000-000000000001", "p3_final")
+		require.Nil(t, q4.Exec())
+
+		// Batch with new prepared children on togglePreparedTable
+		batch := proxy.NewBatch(gocql.LoggedBatch)
+		batch.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, togglePreparedTable), "c0000001-0000-0000-0000-000000000002", "p3_batch_prep")
+		batch.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchA), "c0000001-0000-0000-0000-000000000002", "p3_batch_a")
+		require.Nil(t, proxy.ExecuteBatch(batch))
 
 		// Verify data on origin only
 		var name string
 		err := originCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = c0000001-0000-0000-0000-000000000001", ks, togglePreparedTable)).Scan(&name)
 		require.Nil(t, err)
-		require.Equal(t, "p3_updated", name)
+		require.Equal(t, "p3_final", name)
 
 		// Verify NOT on target
-		var count int
 		iter := targetCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = c0000001-0000-0000-0000-000000000001", ks, togglePreparedTable)).Iter()
-		count = iter.NumRows()
+		require.Equal(t, 0, iter.NumRows(), "data from phase 3 should NOT be on target")
 		iter.Close()
-		require.Equal(t, 0, count, "data from phase 3 should NOT be on target")
 	})
 
 	// ================================================================
 	// PHASE 4: Re-enable target — use the NEW prepared statements
-	// Target should receive UNPREPARED, client re-prepares, data flows to both.
 	// ================================================================
 	t.Run("phase4_reenable_target", func(t *testing.T) {
-		// Re-enable
 		postTargetToggle(t, "enable")
 		requireTargetStatus(t, true)
 
-		// Use the same prepared statements created during disabled period.
-		// gocql will receive UNPREPARED from target, automatically re-prepare, and retry.
+		// Use prepared statements created during disabled period.
+		// gocql receives UNPREPARED from target, auto-re-prepares, and retries.
 		q := proxy.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, togglePreparedTable))
 		q.Bind("d0000001-0000-0000-0000-000000000001", "p4_after_reenable")
 		require.Nil(t, q.Exec())
@@ -253,54 +370,344 @@ func TestTargetToggleCCM(t *testing.T) {
 		q2.Bind("p4_updated_reenable", "d0000001-0000-0000-0000-000000000001")
 		require.Nil(t, q2.Exec())
 
-		// Inline insert to verify basic flow restored
+		// Inline insert
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"INSERT INTO %s.%s (id, name) VALUES (d0000001-0000-0000-0000-000000000002, 'p4_inline')", ks, toggleTable)).Exec())
 
-		// Counter update
+		// Counter
 		require.Nil(t, proxy.Query(fmt.Sprintf(
 			"UPDATE %s.%s SET count = count + 1 WHERE id = d0000001-0000-0000-0000-000000000001", ks, toggleCounterTable)).Exec())
 
-		// Batch
+		// Batch with prepared children
 		batch := proxy.NewBatch(gocql.LoggedBatch)
 		batch.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchA), "d0000001-0000-0000-0000-000000000003", "p4_batch_a")
 		batch.Query(fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, toggleBatchB), "d0000001-0000-0000-0000-000000000003", "p4_batch_b")
 		require.Nil(t, proxy.ExecuteBatch(batch))
 
-		// Verify metrics: both origin and target should now be incrementing
+		// Verify metrics: both should now be incrementing
 		originCountFinal := getMetricValue(t, ks, toggleTable, "origin")
 		targetCountFinal := getMetricValue(t, ks, toggleTable, "target")
 		require.True(t, originCountFinal > originCountBefore,
-			"origin count should be higher than initial: initial=%v final=%v", originCountBefore, originCountFinal)
+			"origin count should be higher: initial=%v final=%v", originCountBefore, originCountFinal)
 		require.True(t, targetCountFinal > targetCountBefore,
-			"target count should be higher than initial (writes resumed): initial=%v final=%v", targetCountBefore, targetCountFinal)
+			"target count should be higher (writes resumed): initial=%v final=%v", targetCountBefore, targetCountFinal)
 
 		// Verify data on TARGET for phase 4 writes
 		var name string
 		err := targetCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = d0000001-0000-0000-0000-000000000001", ks, togglePreparedTable)).Scan(&name)
 		require.Nil(t, err)
-		require.Equal(t, "p4_updated_reenable", name, "prepared statement data should be on target after re-enable")
+		require.Equal(t, "p4_updated_reenable", name, "prepared data should be on target after re-enable")
 
-		// Verify inline data on target
 		err = targetCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = d0000001-0000-0000-0000-000000000002", ks, toggleTable)).Scan(&name)
 		require.Nil(t, err)
 		require.Equal(t, "p4_inline", name, "inline write should be on target after re-enable")
 
-		// Verify batch data on target
 		err = targetCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = d0000001-0000-0000-0000-000000000003", ks, toggleBatchA)).Scan(&name)
 		require.Nil(t, err)
 		require.Equal(t, "p4_batch_a", name, "batch write should be on target after re-enable")
 
-		// Verify the Prometheus gauge shows enabled (1)
+		// Verify gauge shows enabled
 		lines := gatherToggleMetricLines(t)
 		requireTargetEnabledGauge(t, lines, 1)
 	})
+
+	// ================================================================
+	// PHASE 5: Rapid toggle cycles — stability test
+	// ================================================================
+	t.Run("phase5_rapid_toggle_cycles", func(t *testing.T) {
+		for i := 0; i < 5; i++ {
+			postTargetToggle(t, "disable")
+			requireTargetStatus(t, false)
+
+			// Write while disabled — should succeed
+			require.Nil(t, proxy.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (e%07d-0000-0000-0000-000000000001, 'cycle_%d')",
+				ks, toggleTable, i, i)).Exec())
+
+			postTargetToggle(t, "enable")
+			requireTargetStatus(t, true)
+
+			// Write while enabled — should succeed on both
+			require.Nil(t, proxy.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (e%07d-0000-0000-0000-000000000002, 'cycle_%d_enabled')",
+				ks, toggleTable, i, i)).Exec())
+
+			// Verify the enabled write reached target
+			var name string
+			err := targetCluster.GetSession().Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = e%07d-0000-0000-0000-000000000002", ks, toggleTable, i)).Scan(&name)
+			require.Nil(t, err)
+			require.Equal(t, fmt.Sprintf("cycle_%d_enabled", i), name)
+		}
+	})
 }
 
-// gatherToggleMetricLines scrapes the metrics endpoint for the toggle test.
+// TestTargetToggleConcurrentLoadCCM tests the target toggle under concurrent write load.
+// Multiple goroutines continuously write to the proxy while the target is toggled on and off.
+// Verifies no panics, no deadlocks, and writes succeed throughout.
+func TestTargetToggleConcurrentLoadCCM(t *testing.T) {
+	proxyInstance, err := NewProxyInstanceForGlobalCcmClusters(t)
+	require.Nil(t, err)
+	defer proxyInstance.Shutdown()
+
+	srv := startToggleHTTPServer(t, proxyInstance)
+	defer srv.Close()
+
+	originCluster, _, err := SetupOrGetGlobalCcmClusters(t)
+	require.Nil(t, err)
+
+	createToggleTables(t, originCluster.GetSession())
+	// Target tables are shared from global clusters, already created by previous test or setup
+
+	proxy, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+	require.Nil(t, err)
+	defer proxy.Close()
+
+	ks := setup.TestKeyspace
+
+	const numWorkers = 10
+	const writesPerWorker = 50
+	var successCount int64
+	var errorCount int64
+	var wg sync.WaitGroup
+
+	// Start concurrent writers
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for i := 0; i < writesPerWorker; i++ {
+				id := fmt.Sprintf("f%07d-0000-0000-0000-%012d", workerID, i)
+				err := proxy.Query(fmt.Sprintf(
+					"INSERT INTO %s.%s (id, name) VALUES (%s, 'load_w%d_i%d')",
+					ks, toggleLoadTable, id, workerID, i)).Exec()
+				if err != nil {
+					atomic.AddInt64(&errorCount, 1)
+					log.Debugf("Worker %d write %d error: %v", workerID, i, err)
+				} else {
+					atomic.AddInt64(&successCount, 1)
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}(w)
+	}
+
+	// Toggle target on and off during the writes
+	time.Sleep(100 * time.Millisecond) // let writes start
+	for cycle := 0; cycle < 3; cycle++ {
+		postTargetToggle(t, "disable")
+		time.Sleep(200 * time.Millisecond)
+		postTargetToggle(t, "enable")
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	wg.Wait()
+
+	total := atomic.LoadInt64(&successCount) + atomic.LoadInt64(&errorCount)
+	t.Logf("Concurrent load test: %d/%d writes succeeded, %d errors",
+		atomic.LoadInt64(&successCount), total, atomic.LoadInt64(&errorCount))
+
+	// All writes should succeed — the proxy should never return errors due to toggle
+	require.Equal(t, int64(0), atomic.LoadInt64(&errorCount),
+		"no writes should fail due to target toggle")
+	require.Equal(t, int64(numWorkers*writesPerWorker), atomic.LoadInt64(&successCount),
+		"all writes should succeed")
+
+	// Verify at least some data on origin
+	var count int
+	iter := originCluster.GetSession().Query(fmt.Sprintf(
+		"SELECT id FROM %s.%s", ks, toggleLoadTable)).Iter()
+	count = iter.NumRows()
+	iter.Close()
+	require.True(t, count > 0, "origin should have data from load test")
+}
+
+// TestTargetToggleOutageCCM simulates a real production scenario:
+//  1. Start writing to both clusters (target enabled)
+//  2. Stop the target CCM node (simulating outage)
+//  3. Observe errors from the proxy (target is down but still enabled)
+//  4. Disable target via API
+//  5. Writes succeed again (origin only)
+//  6. Restart the target CCM node
+//  7. Re-enable target via API
+//  8. New connections write to both clusters again
+//  9. Verify data on target for writes after re-enable
+func TestTargetToggleOutageCCM(t *testing.T) {
+	// Use temporary clusters so stopping nodes doesn't affect other tests
+	tempCcmSetup, err := setup.NewTemporaryCcmTestSetup(t, true, false)
+	require.Nil(t, err)
+	defer tempCcmSetup.Cleanup()
+
+	// Create tables
+	outageTable := "toggle_outage_test"
+	for _, s := range []*gocql.Session{tempCcmSetup.Origin.GetSession(), tempCcmSetup.Target.GetSession()} {
+		s.Query(fmt.Sprintf("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}", setup.TestKeyspace)).Exec()
+		s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", setup.TestKeyspace, outageTable)).Exec()
+		require.Nil(t, s.Query(fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, name text)", setup.TestKeyspace, outageTable)).Exec())
+	}
+
+	// Create proxy with config pointing to temp clusters
+	testConfig := setup.NewTestConfig(tempCcmSetup.Origin.GetInitialContactPoint(), tempCcmSetup.Target.GetInitialContactPoint())
+	testConfig.TargetEnableHostAssignment = false
+	testConfig.OriginEnableHostAssignment = false
+	proxyInstance, err := setup.NewProxyInstanceWithConfig(testConfig)
+	require.Nil(t, err)
+	defer proxyInstance.Shutdown()
+
+	// HTTP server for toggle API (use a different port to avoid conflicts)
+	outageHTTPAddr := "localhost:14097"
+	mux := http.NewServeMux()
+	mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance))
+	mux.Handle("/api/v1/target/enable", httpzdmproxy.TargetHandler(proxyInstance))
+	mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance))
+	srv := &http.Server{Addr: outageHTTPAddr, Handler: mux}
+	go func() {
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Warnf("outage test http server error: %v", err)
+		}
+	}()
+	defer srv.Close()
+
+	require.Eventually(t, func() bool {
+		resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/target", outageHTTPAddr))
+		if err != nil {
+			return false
+		}
+		resp.Body.Close()
+		return resp.StatusCode == http.StatusOK
+	}, 5*time.Second, 100*time.Millisecond, "HTTP server did not start")
+
+	proxy, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+	require.Nil(t, err)
+	defer proxy.Close()
+
+	ks := setup.TestKeyspace
+
+	// Step 1: Write with both clusters up
+	t.Run("step1_both_up", func(t *testing.T) {
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (aa000001-0000-0000-0000-000000000001, 'both_up')", ks, outageTable)).Exec())
+
+		// Verify on target
+		var name string
+		err := tempCcmSetup.Target.GetSession().Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = aa000001-0000-0000-0000-000000000001", ks, outageTable)).Scan(&name)
+		require.Nil(t, err)
+		require.Equal(t, "both_up", name)
+	})
+
+	// Step 2: Stop the target node
+	t.Run("step2_stop_target", func(t *testing.T) {
+		err := tempCcmSetup.Target.StopNode(0)
+		require.Nil(t, err, "failed to stop target node")
+		t.Log("Target node stopped")
+	})
+
+	// Step 3: Writes should fail or timeout (target is down but still enabled)
+	t.Run("step3_writes_fail_target_down", func(t *testing.T) {
+		// Give the proxy a moment to detect the down node
+		time.Sleep(2 * time.Second)
+
+		// This write may fail/timeout because target is down
+		err := proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (aa000001-0000-0000-0000-000000000002, 'should_fail')", ks, outageTable)).Exec()
+		// We expect an error here — target is down
+		t.Logf("Write with target down: err=%v (error expected)", err)
+	})
+
+	// Step 4: Disable target via API
+	t.Run("step4_disable_target", func(t *testing.T) {
+		resp, err := http.Post(fmt.Sprintf("http://%s/api/v1/target/disable", outageHTTPAddr), "application/json", nil)
+		require.Nil(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		t.Log("Target disabled via API")
+	})
+
+	// Step 5: Writes succeed now (origin only, target disabled)
+	t.Run("step5_writes_succeed_target_disabled", func(t *testing.T) {
+		// New connection since old one might be in a bad state
+		proxy2, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+		require.Nil(t, err, "should be able to connect with target disabled")
+		defer proxy2.Close()
+
+		for i := 0; i < 10; i++ {
+			err := proxy2.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (bb%06d-0000-0000-0000-000000000001, 'disabled_%d')",
+				ks, outageTable, i, i)).Exec()
+			require.Nil(t, err, "write %d should succeed with target disabled: %v", i, err)
+		}
+
+		// Verify data on origin
+		var name string
+		err = tempCcmSetup.Origin.GetSession().Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = bb000000-0000-0000-0000-000000000001", ks, outageTable)).Scan(&name)
+		require.Nil(t, err)
+		require.Equal(t, "disabled_0", name)
+	})
+
+	// Step 6: Restart target
+	t.Run("step6_restart_target", func(t *testing.T) {
+		err := tempCcmSetup.Target.StartNode(0)
+		require.Nil(t, err, "failed to start target node")
+		t.Log("Target node restarted")
+
+		// Wait for it to be ready
+		time.Sleep(5 * time.Second)
+
+		// Verify target is actually up by querying it directly
+		require.Eventually(t, func() bool {
+			testSession, err := utils.ConnectToCluster(
+				tempCcmSetup.Target.GetInitialContactPoint(), "cassandra", "cassandra", 9042)
+			if err != nil {
+				return false
+			}
+			testSession.Close()
+			return true
+		}, 30*time.Second, 1*time.Second, "target did not come back up")
+	})
+
+	// Step 7: Re-enable target
+	t.Run("step7_reenable_target", func(t *testing.T) {
+		resp, err := http.Post(fmt.Sprintf("http://%s/api/v1/target/enable", outageHTTPAddr), "application/json", nil)
+		require.Nil(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		t.Log("Target re-enabled via API")
+	})
+
+	// Step 8: New connections should write to both clusters
+	t.Run("step8_writes_to_both_after_reenable", func(t *testing.T) {
+		// New connection to get a fresh ClientHandler with target connector
+		proxy3, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+		require.Nil(t, err, "should be able to connect after target re-enabled")
+		defer proxy3.Close()
+
+		require.Nil(t, proxy3.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (cc000001-0000-0000-0000-000000000001, 'after_reenable')", ks, outageTable)).Exec())
+
+		// Verify on target — need a fresh session since target was restarted
+		targetSession, err := utils.ConnectToCluster(
+			tempCcmSetup.Target.GetInitialContactPoint(), "cassandra", "cassandra", 9042)
+		require.Nil(t, err, "should be able to connect to restarted target")
+		defer targetSession.Close()
+
+		var name string
+		err = targetSession.Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = cc000001-0000-0000-0000-000000000001", ks, outageTable)).Scan(&name)
+		require.Nil(t, err, "data should be on target after re-enable")
+		require.Equal(t, "after_reenable", name)
+	})
+}
+
+// ================================================================
+// Helper functions
+// ================================================================
+
 func gatherToggleMetricLines(t *testing.T) []string {
 	t.Helper()
 	statusCode, rspStr, err := utils.GetMetrics(toggleHTTPAddr)
@@ -316,7 +723,6 @@ func gatherToggleMetricLines(t *testing.T) []string {
 	return result
 }
 
-// getMetricValue returns the numeric value of the write success metric for the given cluster/keyspace/table.
 func getMetricValue(t *testing.T, keyspace, table, cluster string) float64 {
 	t.Helper()
 	lines := gatherToggleMetricLines(t)
@@ -335,7 +741,6 @@ func getMetricValue(t *testing.T, keyspace, table, cluster string) float64 {
 	return 0
 }
 
-// postTargetToggle sends a POST to /api/v1/target/enable or /api/v1/target/disable.
 func postTargetToggle(t *testing.T, action string) {
 	t.Helper()
 	resp, err := http.Post(fmt.Sprintf("http://%s/api/v1/target/%s", toggleHTTPAddr, action), "application/json", nil)
@@ -344,7 +749,6 @@ func postTargetToggle(t *testing.T, action string) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
-// requireTargetEnabledGauge checks the Prometheus gauge for target_enabled.
 func requireTargetEnabledGauge(t *testing.T, lines []string, expectedValue float64) {
 	t.Helper()
 	for _, line := range lines {
@@ -361,7 +765,6 @@ func requireTargetEnabledGauge(t *testing.T, lines []string, expectedValue float
 	t.Errorf("zdm_target_enabled gauge not found in metrics output")
 }
 
-// requireTargetStatus verifies the target status via the API.
 func requireTargetStatus(t *testing.T, expectedEnabled bool) {
 	t.Helper()
 	resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/target", toggleHTTPAddr))

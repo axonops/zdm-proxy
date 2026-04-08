@@ -1245,18 +1245,29 @@ func (ch *ClientHandler) handleHandshakeRequest(request *frame.RawFrame, wg *syn
 			// secondary is TARGET
 
 			if response.targetResponse == nil {
-				return false, fmt.Errorf("no response received from %v for startup %v", common.ClusterTypeTarget, request)
+				if ch.targetCassandraConnector == nil {
+					// Target is disabled — no secondary response expected.
+					// Use origin response as the aggregated response.
+					aggregatedResponse = response.originResponse
+					secondaryResponse = nil
+					log.Debugf("Target disabled, skipping secondary startup response validation")
+				} else {
+					return false, fmt.Errorf("no response received from %v for startup %v", common.ClusterTypeTarget, request)
+				}
+			} else {
+				secondaryResponse = response.targetResponse
+				aggregatedResponse = response.originResponse
+				secondaryCluster = common.ClusterTypeTarget
 			}
-			secondaryResponse = response.targetResponse
-			aggregatedResponse = response.originResponse
-			secondaryCluster = common.ClusterTypeTarget
 		}
 
 		ch.secondaryStartupResponse = secondaryResponse
 
-		err := validateSecondaryStartupResponse(secondaryResponse, secondaryCluster)
-		if err != nil {
-			return false, fmt.Errorf("unsuccessful startup on %v: %w", secondaryCluster, err)
+		if secondaryResponse != nil {
+			err := validateSecondaryStartupResponse(secondaryResponse, secondaryCluster)
+			if err != nil {
+				return false, fmt.Errorf("unsuccessful startup on %v: %w", secondaryCluster, err)
+			}
 		}
 	}
 
@@ -1277,11 +1288,21 @@ func (ch *ClientHandler) handleHandshakeRequest(request *frame.RawFrame, wg *syn
 
 			// if we add stream id mapping logic in the future, then
 			// we can start the secondary handshake earlier and wait for it to end here
-			secondaryHandshakeChannel, err := ch.startSecondaryHandshake(false)
-			if err != nil {
-				tempResult.err = err
-				startHandshakeCh <- tempResult
-				return
+			var err error
+			var secondaryHandshakeChannel chan error
+			if ch.targetCassandraConnector != nil || ch.forwardAuthToTarget {
+				// Only start secondary handshake if the secondary cluster connector exists.
+				// When target is disabled, targetCassandraConnector is nil and secondary
+				// handshake is skipped (unless auth is forwarded to target, in which case
+				// origin is the secondary and always exists).
+				secondaryHandshakeChannel, err = ch.startSecondaryHandshake(false)
+				if err != nil {
+					tempResult.err = err
+					startHandshakeCh <- tempResult
+					return
+				}
+			} else {
+				log.Debugf("Target disabled, skipping secondary handshake")
 			}
 			var asyncConnectorHandshakeChannel chan error
 			if ch.asyncConnector != nil {
