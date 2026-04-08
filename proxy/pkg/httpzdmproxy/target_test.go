@@ -2,6 +2,7 @@ package httpzdmproxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -10,11 +11,16 @@ import (
 )
 
 type mockToggle struct {
-	enabled bool
+	enabled  bool
+	blockErr error // if set, SetTargetEnabled returns this error
 }
 
-func (m *mockToggle) SetTargetEnabled(enabled bool) {
+func (m *mockToggle) SetTargetEnabled(enabled bool) error {
+	if !enabled && m.blockErr != nil {
+		return m.blockErr
+	}
 	m.enabled = enabled
+	return nil
 }
 
 func (m *mockToggle) IsTargetEnabled() bool {
@@ -130,4 +136,35 @@ func TestTargetHandler_ProxyNotReady(t *testing.T) {
 	var resp targetStatusResponse
 	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
 	require.Equal(t, "proxy not ready", resp.Message)
+}
+
+func TestTargetHandler_DisableBlocked(t *testing.T) {
+	toggle := &mockToggle{enabled: true, blockErr: fmt.Errorf("cannot disable target: read_mode is DUAL_ASYNC_ON_SECONDARY")}
+	handler := TargetHandler(toggle)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/target/disable", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusConflict, rr.Code)
+	var resp targetStatusResponse
+	require.NoError(t, json.Unmarshal(rr.Body.Bytes(), &resp))
+	require.True(t, resp.Enabled, "target should remain enabled when disable is blocked")
+	require.Contains(t, resp.Message, "DUAL_ASYNC_ON_SECONDARY")
+
+	// Verify state didn't change
+	require.True(t, toggle.enabled)
+}
+
+func TestTargetHandler_EnableNotBlockedWhenConfigRestricted(t *testing.T) {
+	// Even with blockErr set, enable should succeed (only disable is blocked)
+	toggle := &mockToggle{enabled: false, blockErr: fmt.Errorf("some restriction")}
+	handler := TargetHandler(toggle)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/target/enable", nil)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.True(t, toggle.enabled)
 }

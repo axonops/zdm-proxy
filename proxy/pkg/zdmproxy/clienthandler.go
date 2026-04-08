@@ -270,14 +270,19 @@ func NewClientHandler(
 		} else {
 			asyncConnInfo = targetCassandraConnInfo
 		}
-		asyncConnector, err = NewClusterConnector(
-			asyncConnInfo, conf, psCache, nodeMetrics, localClientHandlerWg, clientHandlerRequestWg,
-			clientHandlerContext, clientHandlerCancelFunc, respChannel, readScheduler, writeScheduler, requestsDoneCtx,
-			true, asyncPendingRequests, handshakeDone, asyncFrameProcessor, originCCProtoVer,
-			compression)
-		if err != nil {
-			log.Errorf("Could not create async cluster connector to %s, async requests will not be forwarded: %s", asyncConnInfo.connConfig.GetClusterType(), err.Error())
-			asyncConnector = nil
+		if asyncConnInfo == nil {
+			// Target is disabled and async connector would point to target — skip it
+			log.Debugf("Target disabled, skipping async cluster connector creation")
+		} else {
+			asyncConnector, err = NewClusterConnector(
+				asyncConnInfo, conf, psCache, nodeMetrics, localClientHandlerWg, clientHandlerRequestWg,
+				clientHandlerContext, clientHandlerCancelFunc, respChannel, readScheduler, writeScheduler, requestsDoneCtx,
+				true, asyncPendingRequests, handshakeDone, asyncFrameProcessor, originCCProtoVer,
+				compression)
+			if err != nil {
+				log.Errorf("Could not create async cluster connector to %s, async requests will not be forwarded: %s", asyncConnInfo.connConfig.GetClusterType(), err.Error())
+				asyncConnector = nil
+			}
 		}
 	}
 
@@ -1242,7 +1247,13 @@ func (ch *ClientHandler) handleHandshakeRequest(request *frame.RawFrame, wg *syn
 				return false, fmt.Errorf("no response received from %v for startup %v", common.ClusterTypeOrigin, request)
 			}
 			secondaryResponse = response.originResponse
-			aggregatedResponse = response.targetResponse
+			if response.targetResponse != nil {
+				aggregatedResponse = response.targetResponse
+			} else {
+				// Target is disabled — use origin response as aggregated response
+				aggregatedResponse = response.originResponse
+				log.Debugf("Target disabled (forwardAuthToTarget=true), using origin response as aggregated startup response")
+			}
 			secondaryCluster = common.ClusterTypeOrigin
 		} else {
 			// secondary is TARGET

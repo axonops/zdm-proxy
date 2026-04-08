@@ -18,6 +18,7 @@ import (
 
 	"github.com/datastax/zdm-proxy/integration-tests/setup"
 	"github.com/datastax/zdm-proxy/integration-tests/utils"
+	"github.com/datastax/zdm-proxy/proxy/pkg/config"
 	"github.com/datastax/zdm-proxy/proxy/pkg/httpzdmproxy"
 	"github.com/datastax/zdm-proxy/proxy/pkg/zdmproxy"
 )
@@ -698,9 +699,119 @@ func TestTargetToggleOutageCCM(t *testing.T) {
 	})
 }
 
+// TestTargetToggleBlockedByConfigCCM verifies that the toggle API rejects disable
+// when incompatible configurations are active (DUAL_ASYNC_ON_SECONDARY or
+// ForwardClientCredentialsToOrigin). These configs require target to be reachable
+// and are only used in later migration phases.
+func TestTargetToggleBlockedByConfigCCM(t *testing.T) {
+	originCluster, targetCluster, err := SetupOrGetGlobalCcmClusters(t)
+	require.Nil(t, err)
+
+	t.Run("blocked_by_dual_async", func(t *testing.T) {
+		testConfig := setup.NewTestConfig(originCluster.GetInitialContactPoint(), targetCluster.GetInitialContactPoint())
+		testConfig.ReadMode = config.ReadModeDualAsyncOnSecondary
+
+		proxyInstance, err := setup.NewProxyInstanceWithConfig(testConfig)
+		require.Nil(t, err)
+		defer proxyInstance.Shutdown()
+
+		// Attempt to disable — should be rejected
+		err = proxyInstance.SetTargetEnabled(false)
+		require.NotNil(t, err, "disable should be rejected with DUAL_ASYNC_ON_SECONDARY")
+		require.Contains(t, err.Error(), "DUAL_ASYNC_ON_SECONDARY")
+		require.True(t, proxyInstance.IsTargetEnabled(), "target should remain enabled")
+
+		// Enable should always work
+		err = proxyInstance.SetTargetEnabled(true)
+		require.Nil(t, err, "enable should always succeed")
+	})
+
+	t.Run("blocked_by_forward_client_creds", func(t *testing.T) {
+		testConfig := setup.NewTestConfig(originCluster.GetInitialContactPoint(), targetCluster.GetInitialContactPoint())
+		testConfig.ForwardClientCredentialsToOrigin = true
+
+		proxyInstance, err := setup.NewProxyInstanceWithConfig(testConfig)
+		require.Nil(t, err)
+		defer proxyInstance.Shutdown()
+
+		// Attempt to disable — should be rejected
+		err = proxyInstance.SetTargetEnabled(false)
+		require.NotNil(t, err, "disable should be rejected with ForwardClientCredentialsToOrigin")
+		require.Contains(t, err.Error(), "forward_client_credentials_to_origin")
+		require.True(t, proxyInstance.IsTargetEnabled(), "target should remain enabled")
+	})
+
+	t.Run("allowed_with_default_config", func(t *testing.T) {
+		testConfig := setup.NewTestConfig(originCluster.GetInitialContactPoint(), targetCluster.GetInitialContactPoint())
+
+		proxyInstance, err := setup.NewProxyInstanceWithConfig(testConfig)
+		require.Nil(t, err)
+		defer proxyInstance.Shutdown()
+
+		// Should succeed with default config
+		err = proxyInstance.SetTargetEnabled(false)
+		require.Nil(t, err, "disable should succeed with default config")
+		require.False(t, proxyInstance.IsTargetEnabled())
+
+		err = proxyInstance.SetTargetEnabled(true)
+		require.Nil(t, err)
+		require.True(t, proxyInstance.IsTargetEnabled())
+	})
+
+	t.Run("blocked_via_http_api", func(t *testing.T) {
+		testConfig := setup.NewTestConfig(originCluster.GetInitialContactPoint(), targetCluster.GetInitialContactPoint())
+		testConfig.ReadMode = config.ReadModeDualAsyncOnSecondary
+
+		proxyInstance, err := setup.NewProxyInstanceWithConfig(testConfig)
+		require.Nil(t, err)
+		defer proxyInstance.Shutdown()
+
+		// Start HTTP server on a unique port
+		blockedHTTPAddr := "localhost:14096"
+		mux := http.NewServeMux()
+		mux.Handle("/api/v1/target", httpzdmproxy.TargetHandler(proxyInstance))
+		mux.Handle("/api/v1/target/disable", httpzdmproxy.TargetHandler(proxyInstance))
+		srv := &http.Server{Addr: blockedHTTPAddr, Handler: mux}
+		go func() {
+			if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+				log.Warnf("blocked test http server error: %v", err)
+			}
+		}()
+		defer srv.Close()
+
+		require.Eventually(t, func() bool {
+			resp, err := http.Get(fmt.Sprintf("http://%s/api/v1/target", blockedHTTPAddr))
+			if err != nil {
+				return false
+			}
+			resp.Body.Close()
+			return resp.StatusCode == http.StatusOK
+		}, 5*time.Second, 100*time.Millisecond, "HTTP server did not start")
+
+		// POST disable — should get 409 Conflict
+		resp, err := http.Post(fmt.Sprintf("http://%s/api/v1/target/disable", blockedHTTPAddr), "application/json", nil)
+		require.Nil(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusConflict, resp.StatusCode,
+			"disable should return 409 Conflict when DUAL_ASYNC is enabled")
+
+		body, err := io.ReadAll(resp.Body)
+		require.Nil(t, err)
+		var status targetStatusResponse
+		require.Nil(t, json.Unmarshal(body, &status))
+		require.True(t, status.Enabled, "should remain enabled")
+		require.Contains(t, status.Message, "DUAL_ASYNC_ON_SECONDARY")
+	})
+}
+
 // ================================================================
 // Helper functions
 // ================================================================
+
+type targetStatusResponse struct {
+	Enabled bool   `json:"enabled"`
+	Message string `json:"message,omitempty"`
+}
 
 func gatherToggleMetricLines(t *testing.T) []string {
 	t.Helper()

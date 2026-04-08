@@ -128,6 +128,15 @@ curl -X POST http://localhost:14001/api/v1/target/enable
 - **When re-enabled**: Requests resume flowing to both clusters. If prepared statements are stale on the target, the client driver's standard UNPREPARED recovery mechanism handles re-preparation automatically.
 - **Not persisted**: If the proxy restarts, the target defaults back to enabled.
 
+### Restrictions
+
+The toggle is only available when the proxy is running with default migration-phase configs:
+
+- **`read_mode`** must be `PRIMARY_ONLY` (default). If `DUAL_ASYNC_ON_SECONDARY` is enabled, the disable endpoint returns `409 Conflict`.
+- **`forward_client_credentials_to_origin`** must be `false` (default). If enabled, the disable endpoint returns `409 Conflict`.
+
+These configs require the target cluster to be reachable and are used in later migration phases where disabling target is not appropriate. To use the target toggle, restart the proxy without these settings.
+
 ### Monitoring
 
 A Prometheus gauge `zdm_target_enabled` is exposed on the `/metrics` endpoint. Value is `1` when enabled, `0` when disabled. Use this for alerting on unintended state.

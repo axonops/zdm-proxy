@@ -6,7 +6,7 @@ import (
 )
 
 type TargetToggle interface {
-	SetTargetEnabled(enabled bool)
+	SetTargetEnabled(enabled bool) error
 	IsTargetEnabled() bool
 }
 
@@ -48,7 +48,14 @@ func TargetHandler(toggle TargetToggle) http.Handler {
 				http.Error(rsp, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			toggle.SetTargetEnabled(true)
+			if err := toggle.SetTargetEnabled(true); err != nil {
+				rsp.WriteHeader(http.StatusConflict)
+				json.NewEncoder(rsp).Encode(targetStatusResponse{
+					Enabled: toggle.IsTargetEnabled(),
+					Message: err.Error(),
+				})
+				return
+			}
 			json.NewEncoder(rsp).Encode(targetStatusResponse{
 				Enabled: true,
 				Message: "Target enabled",
@@ -59,7 +66,14 @@ func TargetHandler(toggle TargetToggle) http.Handler {
 				http.Error(rsp, "method not allowed", http.StatusMethodNotAllowed)
 				return
 			}
-			toggle.SetTargetEnabled(false)
+			if err := toggle.SetTargetEnabled(false); err != nil {
+				rsp.WriteHeader(http.StatusConflict)
+				json.NewEncoder(rsp).Encode(targetStatusResponse{
+					Enabled: toggle.IsTargetEnabled(),
+					Message: err.Error(),
+				})
+				return
+			}
 			json.NewEncoder(rsp).Encode(targetStatusResponse{
 				Enabled: false,
 				Message: "Target disabled",

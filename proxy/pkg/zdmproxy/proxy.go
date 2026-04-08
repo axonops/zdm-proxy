@@ -671,7 +671,19 @@ func (p *ZdmProxy) GetTargetControlConn() *ControlConn {
 	return p.targetControlConn
 }
 
-func (p *ZdmProxy) SetTargetEnabled(enabled bool) {
+func (p *ZdmProxy) SetTargetEnabled(enabled bool) error {
+	// Block toggling when incompatible configs are active.
+	// These configs require target to be reachable and are only used in
+	// later migration phases where disabling target makes no sense.
+	if !enabled {
+		if p.readMode == common.ReadModeDualAsyncOnSecondary {
+			return fmt.Errorf("cannot disable target: read_mode is DUAL_ASYNC_ON_SECONDARY, restart proxy with PRIMARY_ONLY to use target toggle")
+		}
+		if p.Conf.ForwardClientCredentialsToOrigin {
+			return fmt.Errorf("cannot disable target: forward_client_credentials_to_origin is enabled, restart proxy without it to use target toggle")
+		}
+	}
+
 	old := p.targetEnabled.Swap(enabled)
 	if old != enabled {
 		if enabled {
@@ -680,6 +692,7 @@ func (p *ZdmProxy) SetTargetEnabled(enabled bool) {
 			log.Warn("Target cluster DISABLED via API — no requests will be forwarded to target")
 		}
 	}
+	return nil
 }
 
 func (p *ZdmProxy) IsTargetEnabled() bool {

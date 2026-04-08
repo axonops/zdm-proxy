@@ -11,9 +11,20 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/datastax/zdm-proxy/proxy/pkg/common"
+	"github.com/datastax/zdm-proxy/proxy/pkg/config"
 	"github.com/datastax/zdm-proxy/proxy/pkg/metrics"
 	"github.com/datastax/zdm-proxy/proxy/pkg/metrics/noopmetrics"
 )
+
+func newTestProxy() *ZdmProxy {
+	targetEnabled := &atomic.Bool{}
+	targetEnabled.Store(true)
+	return &ZdmProxy{
+		targetEnabled: targetEnabled,
+		Conf:          config.New(),
+		readMode:      common.ReadModePrimaryOnly,
+	}
+}
 
 // ============================================================
 // requestContextImpl with effectiveForwardDecision
@@ -160,58 +171,86 @@ func TestRequestContext_Cancel_PreventsCompletion(t *testing.T) {
 // ============================================================
 
 func TestZdmProxy_TargetEnabled_DefaultTrue(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(true)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
-
+	proxy := newTestProxy()
 	require.True(t, proxy.IsTargetEnabled())
 }
 
 func TestZdmProxy_TargetEnabled_SetDisable(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(true)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
-
-	proxy.SetTargetEnabled(false)
+	proxy := newTestProxy()
+	require.Nil(t, proxy.SetTargetEnabled(false))
 	require.False(t, proxy.IsTargetEnabled())
 }
 
 func TestZdmProxy_TargetEnabled_SetEnable(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(false)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
-
-	proxy.SetTargetEnabled(true)
+	proxy := newTestProxy()
+	proxy.SetTargetEnabled(false)
+	require.Nil(t, proxy.SetTargetEnabled(true))
 	require.True(t, proxy.IsTargetEnabled())
 }
 
 func TestZdmProxy_TargetEnabled_Idempotent(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(true)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
+	proxy := newTestProxy()
 
-	// Disabling twice should be fine
-	proxy.SetTargetEnabled(false)
-	proxy.SetTargetEnabled(false)
+	require.Nil(t, proxy.SetTargetEnabled(false))
+	require.Nil(t, proxy.SetTargetEnabled(false))
 	require.False(t, proxy.IsTargetEnabled())
 
-	// Enabling twice should be fine
-	proxy.SetTargetEnabled(true)
-	proxy.SetTargetEnabled(true)
+	require.Nil(t, proxy.SetTargetEnabled(true))
+	require.Nil(t, proxy.SetTargetEnabled(true))
 	require.True(t, proxy.IsTargetEnabled())
 }
 
 func TestZdmProxy_TargetEnabled_RapidToggle(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(true)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
+	proxy := newTestProxy()
 
 	for i := 0; i < 1000; i++ {
-		proxy.SetTargetEnabled(false)
+		require.Nil(t, proxy.SetTargetEnabled(false))
 		require.False(t, proxy.IsTargetEnabled())
-		proxy.SetTargetEnabled(true)
+		require.Nil(t, proxy.SetTargetEnabled(true))
 		require.True(t, proxy.IsTargetEnabled())
 	}
+}
+
+// ============================================================
+// Validation: block disable when incompatible configs active
+// ============================================================
+
+func TestZdmProxy_TargetEnabled_BlockedByDualAsync(t *testing.T) {
+	proxy := newTestProxy()
+	proxy.readMode = common.ReadModeDualAsyncOnSecondary
+
+	err := proxy.SetTargetEnabled(false)
+	require.NotNil(t, err)
+	require.Contains(t, err.Error(), "DUAL_ASYNC_ON_SECONDARY")
+	require.True(t, proxy.IsTargetEnabled(), "should remain enabled when blocked")
+}
+
+func TestZdmProxy_TargetEnabled_BlockedByForwardClientCreds(t *testing.T) {
+	proxy := newTestProxy()
+	proxy.Conf.ForwardClientCredentialsToOrigin = true
+
+	err := proxy.SetTargetEnabled(false)
+	require.NotNil(t, err)
+	require.Contains(t, err.Error(), "forward_client_credentials_to_origin")
+	require.True(t, proxy.IsTargetEnabled(), "should remain enabled when blocked")
+}
+
+func TestZdmProxy_TargetEnabled_EnableAlwaysAllowed(t *testing.T) {
+	proxy := newTestProxy()
+	proxy.readMode = common.ReadModeDualAsyncOnSecondary
+	proxy.Conf.ForwardClientCredentialsToOrigin = true
+	proxy.targetEnabled.Store(false) // force disabled state
+
+	// Enable should always work, regardless of config
+	require.Nil(t, proxy.SetTargetEnabled(true))
+	require.True(t, proxy.IsTargetEnabled())
+}
+
+func TestZdmProxy_TargetEnabled_AllowedWithDefaultConfig(t *testing.T) {
+	proxy := newTestProxy()
+	// Default config: PRIMARY_ONLY, ForwardClientCredentialsToOrigin=false
+	require.Nil(t, proxy.SetTargetEnabled(false))
+	require.False(t, proxy.IsTargetEnabled())
 }
 
 // ============================================================
@@ -219,9 +258,7 @@ func TestZdmProxy_TargetEnabled_RapidToggle(t *testing.T) {
 // ============================================================
 
 func TestZdmProxy_TargetEnabled_ConcurrentAccess(t *testing.T) {
-	targetEnabled := &atomic.Bool{}
-	targetEnabled.Store(true)
-	proxy := &ZdmProxy{targetEnabled: targetEnabled}
+	proxy := newTestProxy()
 
 	var wg sync.WaitGroup
 	const goroutines = 100
@@ -254,7 +291,6 @@ func TestZdmProxy_TargetEnabled_ConcurrentAccess(t *testing.T) {
 	}
 
 	wg.Wait()
-	// No assertion on final value — the point is no races or panics.
 }
 
 // ============================================================
