@@ -166,7 +166,10 @@ func NewClientHandler(
 	targetEnabled *atomic.Bool) (*ClientHandler, error) {
 
 	originEndpointId := originCassandraConnInfo.endpoint.GetEndpointIdentifier()
-	targetEndpointId := targetCassandraConnInfo.endpoint.GetEndpointIdentifier()
+	targetEndpointId := ""
+	if targetCassandraConnInfo != nil {
+		targetEndpointId = targetCassandraConnInfo.endpoint.GetEndpointIdentifier()
+	}
 	asyncEndpointId := ""
 	if readMode == common.ReadModeDualAsyncOnSecondary {
 		if primaryCluster == common.ClusterTypeTarget {
