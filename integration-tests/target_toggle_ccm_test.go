@@ -438,6 +438,277 @@ func TestTargetToggleCCM(t *testing.T) {
 	})
 }
 
+// TestTargetToggleEdgeCasesCCM tests edge cases that could break under target toggle:
+// schema changes, USE keyspace, reads while disabled, multiple new connections while
+// disabled, mixed read/write workload, and DDL+DML lifecycle across toggle.
+func TestTargetToggleEdgeCasesCCM(t *testing.T) {
+	proxyInstance, err := NewProxyInstanceForGlobalCcmClusters(t)
+	require.Nil(t, err)
+	defer proxyInstance.Shutdown()
+
+	srv := startToggleHTTPServer(t, proxyInstance)
+	defer srv.Close()
+
+	originCluster, targetCluster, err := SetupOrGetGlobalCcmClusters(t)
+	require.Nil(t, err)
+
+	ks := setup.TestKeyspace
+
+	// Create a shared table for edge case tests
+	edgeTable := "toggle_edge_test"
+	for _, s := range []*gocql.Session{originCluster.GetSession(), targetCluster.GetSession()} {
+		s.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", ks, edgeTable)).Exec()
+		require.Nil(t, s.Query(fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, name text)", ks, edgeTable)).Exec())
+	}
+
+	proxy, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+	require.Nil(t, err)
+	defer proxy.Close()
+
+	// ================================================================
+	// Test: SELECT reads work while target is disabled
+	// ================================================================
+	t.Run("reads_while_disabled", func(t *testing.T) {
+		// Write some data while enabled
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (f0000001-0000-0000-0000-000000000001, 'read_test')", ks, edgeTable)).Exec())
+
+		postTargetToggle(t, "disable")
+		defer postTargetToggle(t, "enable")
+
+		// SELECT should still work — reads go to origin
+		var name string
+		err := proxy.Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = f0000001-0000-0000-0000-000000000001", ks, edgeTable)).Scan(&name)
+		require.Nil(t, err, "SELECT should work while target disabled")
+		require.Equal(t, "read_test", name)
+
+		// Multiple reads
+		for i := 0; i < 20; i++ {
+			err = proxy.Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000001-0000-0000-0000-000000000001", ks, edgeTable)).Scan(&name)
+			require.Nil(t, err, "repeated SELECT %d should work while target disabled", i)
+		}
+	})
+
+	// ================================================================
+	// Test: USE keyspace works while target disabled
+	// ================================================================
+	t.Run("use_keyspace_while_disabled", func(t *testing.T) {
+		postTargetToggle(t, "disable")
+		defer postTargetToggle(t, "enable")
+
+		// USE keyspace through proxy — this is a forwardToBoth request
+		// that should be redirected to origin only
+		err := proxy.Query(fmt.Sprintf("USE %s", ks)).Exec()
+		require.Nil(t, err, "USE keyspace should work while target disabled")
+
+		// Write after USE — should still work
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s (id, name) VALUES (f0000002-0000-0000-0000-000000000001, 'after_use')", edgeTable)).Exec())
+
+		// Verify data on origin
+		var name string
+		err = originCluster.GetSession().Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = f0000002-0000-0000-0000-000000000001", ks, edgeTable)).Scan(&name)
+		require.Nil(t, err)
+		require.Equal(t, "after_use", name)
+	})
+
+	// ================================================================
+	// Test: Schema changes (DDL) while target disabled
+	// ================================================================
+	t.Run("schema_changes_while_disabled", func(t *testing.T) {
+		postTargetToggle(t, "disable")
+
+		// CREATE TABLE through proxy while disabled — should work on origin only
+		ddlTable := "toggle_ddl_test"
+		proxy.Query(fmt.Sprintf("DROP TABLE IF EXISTS %s.%s", ks, ddlTable)).Exec()
+		err := proxy.Query(fmt.Sprintf(
+			"CREATE TABLE %s.%s (id uuid PRIMARY KEY, val text)", ks, ddlTable)).Exec()
+		require.Nil(t, err, "CREATE TABLE should work while target disabled")
+
+		// Write to the new table
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, val) VALUES (f0000003-0000-0000-0000-000000000001, 'ddl_test')", ks, ddlTable)).Exec())
+
+		// Verify on origin
+		var val string
+		err = originCluster.GetSession().Query(fmt.Sprintf(
+			"SELECT val FROM %s.%s WHERE id = f0000003-0000-0000-0000-000000000001", ks, ddlTable)).Scan(&val)
+		require.Nil(t, err)
+		require.Equal(t, "ddl_test", val)
+
+		// Re-enable target
+		postTargetToggle(t, "enable")
+
+		// Create the table on target manually (it doesn't exist there yet)
+		require.Nil(t, targetCluster.GetSession().Query(fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s.%s (id uuid PRIMARY KEY, val text)", ks, ddlTable)).Exec())
+
+		// Now writes should go to both
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, val) VALUES (f0000003-0000-0000-0000-000000000002, 'after_reenable')", ks, ddlTable)).Exec())
+
+		// Verify on target
+		err = targetCluster.GetSession().Query(fmt.Sprintf(
+			"SELECT val FROM %s.%s WHERE id = f0000003-0000-0000-0000-000000000002", ks, ddlTable)).Scan(&val)
+		require.Nil(t, err)
+		require.Equal(t, "after_reenable", val)
+	})
+
+	// ================================================================
+	// Test: Multiple new connections while target is disabled
+	// ================================================================
+	t.Run("multiple_new_connections_while_disabled", func(t *testing.T) {
+		postTargetToggle(t, "disable")
+		defer postTargetToggle(t, "enable")
+
+		// Open several new sessions while disabled — each creates a new
+		// ClientHandler without a target connector
+		sessions := make([]*gocql.Session, 5)
+		for i := 0; i < 5; i++ {
+			s, err := utils.ConnectToCluster("127.0.0.1", "", "", 14002)
+			require.Nil(t, err, "new connection %d should succeed while target disabled", i)
+			sessions[i] = s
+		}
+
+		// Write through each session
+		for i, s := range sessions {
+			err := s.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (f0000004-0000-0000-0000-%012d, 'conn_%d')",
+				ks, edgeTable, i, i)).Exec()
+			require.Nil(t, err, "write on connection %d should succeed while target disabled", i)
+		}
+
+		// Read through each session
+		for i, s := range sessions {
+			var name string
+			err := s.Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000004-0000-0000-0000-%012d",
+				ks, edgeTable, i)).Scan(&name)
+			require.Nil(t, err, "read on connection %d should work while target disabled", i)
+			require.Equal(t, fmt.Sprintf("conn_%d", i), name)
+		}
+
+		// Close all sessions
+		for _, s := range sessions {
+			s.Close()
+		}
+	})
+
+	// ================================================================
+	// Test: Interleaved reads and writes during toggle
+	// ================================================================
+	t.Run("interleaved_reads_writes_during_toggle", func(t *testing.T) {
+		// Seed data
+		require.Nil(t, proxy.Query(fmt.Sprintf(
+			"INSERT INTO %s.%s (id, name) VALUES (f0000005-0000-0000-0000-000000000001, 'seed')", ks, edgeTable)).Exec())
+
+		for cycle := 0; cycle < 3; cycle++ {
+			// Disable
+			postTargetToggle(t, "disable")
+
+			// Mix of reads and writes
+			var name string
+			err := proxy.Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000005-0000-0000-0000-000000000001", ks, edgeTable)).Scan(&name)
+			require.Nil(t, err, "read in cycle %d should work while disabled", cycle)
+
+			require.Nil(t, proxy.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (f0000005-0000-0000-0000-%012d, 'cycle_%d')",
+				ks, edgeTable, cycle+10, cycle)).Exec())
+
+			err = proxy.Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000005-0000-0000-0000-%012d",
+				ks, edgeTable, cycle+10)).Scan(&name)
+			require.Nil(t, err, "read after write in cycle %d should work while disabled", cycle)
+			require.Equal(t, fmt.Sprintf("cycle_%d", cycle), name)
+
+			// Re-enable
+			postTargetToggle(t, "enable")
+
+			// Verify reads and writes work after re-enable
+			require.Nil(t, proxy.Query(fmt.Sprintf(
+				"INSERT INTO %s.%s (id, name) VALUES (f0000005-0000-0000-0000-%012d, 'enabled_%d')",
+				ks, edgeTable, cycle+20, cycle)).Exec())
+
+			err = proxy.Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000005-0000-0000-0000-%012d",
+				ks, edgeTable, cycle+20)).Scan(&name)
+			require.Nil(t, err, "read after re-enable in cycle %d should work", cycle)
+			require.Equal(t, fmt.Sprintf("enabled_%d", cycle), name)
+		}
+	})
+
+	// ================================================================
+	// Test: Prepared statements survive multiple toggle cycles
+	// ================================================================
+	t.Run("prepared_statements_survive_multiple_cycles", func(t *testing.T) {
+		// Prepare a statement while enabled
+		insertQ := fmt.Sprintf("INSERT INTO %s.%s (id, name) VALUES (?, ?)", ks, edgeTable)
+		selectQ := fmt.Sprintf("SELECT name FROM %s.%s WHERE id = ?", ks, edgeTable)
+
+		// First use while enabled — gocql auto-prepares
+		q := proxy.Query(insertQ)
+		q.Bind("f0000006-0000-0000-0000-000000000001", "ps_cycle_0")
+		require.Nil(t, q.Exec())
+
+		// Toggle 5 times, using the same prepared statements each time
+		for cycle := 0; cycle < 5; cycle++ {
+			postTargetToggle(t, "disable")
+
+			// Use existing prepared statement while disabled
+			q = proxy.Query(insertQ)
+			q.Bind(fmt.Sprintf("f0000006-0000-0000-0000-%012d", cycle+10), fmt.Sprintf("disabled_%d", cycle))
+			require.Nil(t, q.Exec(), "prepared INSERT should work in disabled cycle %d", cycle)
+
+			// Read with prepared statement
+			var name string
+			q = proxy.Query(selectQ)
+			q.Bind(fmt.Sprintf("f0000006-0000-0000-0000-%012d", cycle+10))
+			require.Nil(t, q.Scan(&name), "prepared SELECT should work in disabled cycle %d", cycle)
+			require.Equal(t, fmt.Sprintf("disabled_%d", cycle), name)
+
+			postTargetToggle(t, "enable")
+
+			// Use same prepared statement while enabled — should trigger
+			// UNPREPARED recovery on target for first use after re-enable
+			q = proxy.Query(insertQ)
+			q.Bind(fmt.Sprintf("f0000006-0000-0000-0000-%012d", cycle+20), fmt.Sprintf("enabled_%d", cycle))
+			require.Nil(t, q.Exec(), "prepared INSERT should work in enabled cycle %d", cycle)
+
+			// Verify on target
+			var targetName string
+			err := targetCluster.GetSession().Query(fmt.Sprintf(
+				"SELECT name FROM %s.%s WHERE id = f0000006-0000-0000-0000-%012d",
+				ks, edgeTable, cycle+20)).Scan(&targetName)
+			require.Nil(t, err, "data should be on target after re-enable in cycle %d", cycle)
+			require.Equal(t, fmt.Sprintf("enabled_%d", cycle), targetName)
+		}
+	})
+
+	// ================================================================
+	// Test: system.local and system.peers queries while disabled
+	// ================================================================
+	t.Run("system_queries_while_disabled", func(t *testing.T) {
+		postTargetToggle(t, "disable")
+		defer postTargetToggle(t, "enable")
+
+		// system.local query — these are intercepted by the proxy
+		var clusterName string
+		err := proxy.Query("SELECT cluster_name FROM system.local").Scan(&clusterName)
+		require.Nil(t, err, "system.local query should work while target disabled")
+		require.NotEmpty(t, clusterName)
+
+		// system.peers query
+		iter := proxy.Query("SELECT peer FROM system.peers").Iter()
+		iter.Close()
+		// No assertion on content — just verify it doesn't panic
+	})
+}
+
 // TestTargetToggleConcurrentLoadCCM tests the target toggle under concurrent write load.
 // Multiple goroutines continuously write to the proxy while the target is toggled on and off.
 // Verifies no panics, no deadlocks, and writes succeed throughout.
