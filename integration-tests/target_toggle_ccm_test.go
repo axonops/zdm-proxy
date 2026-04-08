@@ -493,27 +493,29 @@ func TestTargetToggleEdgeCasesCCM(t *testing.T) {
 	})
 
 	// ================================================================
-	// Test: USE keyspace works while target disabled
+	// Test: Writes with fully qualified keyspace.table while disabled
+	// (gocql doesn't support USE statements directly)
 	// ================================================================
-	t.Run("use_keyspace_while_disabled", func(t *testing.T) {
+	t.Run("qualified_writes_while_disabled", func(t *testing.T) {
 		postTargetToggle(t, "disable")
 		defer postTargetToggle(t, "enable")
 
-		// USE keyspace through proxy — this is a forwardToBoth request
-		// that should be redirected to origin only
-		err := proxy.Query(fmt.Sprintf("USE %s", ks)).Exec()
-		require.Nil(t, err, "USE keyspace should work while target disabled")
-
-		// Write after USE — should still work
+		// Write with fully qualified keyspace.table — should succeed on origin only
 		require.Nil(t, proxy.Query(fmt.Sprintf(
-			"INSERT INTO %s (id, name) VALUES (f0000002-0000-0000-0000-000000000001, 'after_use')", edgeTable)).Exec())
+			"INSERT INTO %s.%s (id, name) VALUES (f0000002-0000-0000-0000-000000000001, 'qualified')", ks, edgeTable)).Exec())
 
 		// Verify data on origin
 		var name string
 		err = originCluster.GetSession().Query(fmt.Sprintf(
 			"SELECT name FROM %s.%s WHERE id = f0000002-0000-0000-0000-000000000001", ks, edgeTable)).Scan(&name)
 		require.Nil(t, err)
-		require.Equal(t, "after_use", name)
+		require.Equal(t, "qualified", name)
+
+		// Verify NOT on target
+		iter := targetCluster.GetSession().Query(fmt.Sprintf(
+			"SELECT name FROM %s.%s WHERE id = f0000002-0000-0000-0000-000000000001", ks, edgeTable)).Iter()
+		require.Equal(t, 0, iter.NumRows(), "data should NOT be on target while disabled")
+		iter.Close()
 	})
 
 	// ================================================================
