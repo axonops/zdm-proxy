@@ -24,15 +24,21 @@ Usage:
     # Custom thresholds
     python3 zdm-health-check.py --interval 60 --failed-writes-threshold 10 --write-timeout-threshold 10
 
+    # With per-table write failure log
+    python3 zdm-health-check.py --interval 60 --log-file /var/log/zdm-write-failures.log
+
 Environment variables (all optional, CLI args take precedence):
     ZDM_METRICS_URL                - metrics endpoint (default: http://localhost:14001/metrics)
     ZDM_CHECK_INTERVAL             - seconds between checks when running in loop mode
-    ZDM_FAILED_WRITES_THRESHOLD    - alert if failed writes increase by more than this per interval (default: 5)
-    ZDM_WRITE_TIMEOUT_THRESHOLD    - alert if target write timeouts increase by more than this per interval (default: 5)
-    ZDM_WRITE_DIVERGENCE_THRESHOLD - alert if origin/target per-table write counts differ by more than this (default: 0)
-    ZDM_SLACK_WEBHOOK_URL          - Slack incoming webhook URL
+    ZDM_FAILED_WRITES_THRESHOLD         - alert if failed writes (target/both) increase by more than this per interval (default: 5)
+    ZDM_WRITE_TIMEOUT_THRESHOLD         - alert if target read failures increase by more than this per interval (default: 5)
+    ZDM_FAILED_ORIGIN_WRITES_THRESHOLD  - alert if origin write failures increase by more than this per interval (default: 0)
+    ZDM_ZERO_CLIENTS_INTERVALS          - alert if client connections stay at 0 for this many consecutive intervals (default: 2)
+    ZDM_P99_LATENCY_THRESHOLD_MS        - alert if estimated p99 latency exceeds this value in ms (default: 500)
+    ZDM_SLACK_WEBHOOK_URL               - Slack incoming webhook URL
     ZDM_PAGERDUTY_ROUTING_KEY      - PagerDuty Events API v2 integration/routing key
     ZDM_PAGERDUTY_SOURCE           - source field for PagerDuty events (default: zdm-proxy)
+    ZDM_WRITE_FAILURES_LOG         - path to per-table write failure log file (default: zdm-write-failures.log)
 """
 
 import argparse
@@ -47,6 +53,8 @@ from datetime import datetime, timezone
 
 MAX_RESPONSE_BYTES = 1024 * 1024  # 1MB safety cap on metrics response
 SLACK_COOLDOWN_SECONDS = 300      # Don't send more than one Slack alert per 5 minutes
+
+WRITE_SUCCESS_METRIC = "zdm_proxy_write_success_total"
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +97,169 @@ def sum_metrics_matching(metrics, prefix, label_filter):
     return sum(v for k, v in metrics.items() if k.startswith(prefix) and label_filter in k)
 
 
+def get_histogram_buckets(metrics, metric_type):
+    """Return sorted list of (le_float, value, original_key) for the given histogram type."""
+    prefix = f'zdm_proxy_request_duration_seconds_bucket{{type="{metric_type}"'
+    result = []
+    for key, val in metrics.items():
+        if not key.startswith(prefix):
+            continue
+        try:
+            le_str = key.split(',le="')[1].rstrip('"}')
+            le = float('inf') if le_str == '+Inf' else float(le_str)
+            result.append((le, val, key))
+        except (IndexError, ValueError):
+            continue
+    return sorted(result, key=lambda x: x[0])
+
+
+def estimate_p99(metrics, prev_metrics, metric_type):
+    """Estimate p99 latency in seconds for the given request type over the last interval.
+
+    Returns the estimated p99 in seconds, or None if there were no requests this interval.
+    """
+    buckets = get_histogram_buckets(metrics, metric_type)
+    if not buckets:
+        return None
+
+    if prev_metrics:
+        delta_buckets = [
+            (le, max(0.0, val - prev_metrics.get(key, 0.0)), key)
+            for le, val, key in buckets
+        ]
+    else:
+        delta_buckets = buckets
+
+    total = next((d for le, d, _ in delta_buckets if le == float('inf')), 0.0)
+    if total == 0:
+        return None
+
+    target = 0.99 * total
+    prev_count = 0.0
+    prev_le = 0.0
+    for le, count, _ in delta_buckets:
+        if le == float('inf'):
+            break
+        if count >= target:
+            if count == prev_count:
+                return le
+            frac = (target - prev_count) / (count - prev_count)
+            return prev_le + frac * (le - prev_le)
+        prev_count = count
+        prev_le = le
+
+    # p99 falls in the last finite bucket
+    last_finite = next((le for le, _, _ in reversed(delta_buckets) if le != float('inf')), None)
+    return last_finite
+
+
+# ---------------------------------------------------------------------------
+# Per-table write failure detection
+# ---------------------------------------------------------------------------
+
+def parse_metric_labels(key):
+    """Parse label key-value pairs from a Prometheus metric key string.
+
+    Example: 'zdm_proxy_write_success_total{cluster="origin",keyspace="ks1",table="users"}'
+    Returns: {'cluster': 'origin', 'keyspace': 'ks1', 'table': 'users'}
+    """
+    labels = {}
+    brace_start = key.find('{')
+    if brace_start == -1:
+        return labels
+    inner = key[brace_start + 1:].rstrip('}')
+    for part in inner.split(','):
+        if '=' not in part:
+            continue
+        k, _, v = part.partition('=')
+        labels[k.strip()] = v.strip().strip('"')
+    return labels
+
+
+def extract_write_success_per_table(metrics):
+    """Return {(cluster, keyspace, table): float} from zdm_proxy_write_success_total metrics."""
+    result = {}
+    prefix = WRITE_SUCCESS_METRIC + "{"
+    for key, val in metrics.items():
+        if not key.startswith(prefix):
+            continue
+        lbls = parse_metric_labels(key)
+        cluster = lbls.get("cluster", "")
+        keyspace = lbls.get("keyspace", "")
+        table = lbls.get("table", "")
+        if cluster and keyspace and table:
+            result[(cluster, keyspace, table)] = val
+    return result
+
+
+def detect_per_table_write_failures(metrics, prev_metrics):
+    """Detect per-table write failures by comparing origin vs target write success deltas.
+
+    When a write reaches the proxy it is forwarded to BOTH clusters. If the write
+    succeeds on origin but not on target, origin's counter increments while target's
+    does not — the difference is the number of failed writes for that table.
+    The reverse holds for origin-only failures.
+
+    Returns list of (side, keyspace, table, failed_count) where:
+      side="target"  → writes succeeded on origin but FAILED on target
+      side="origin"  → writes succeeded on target but FAILED on origin
+
+    Note: writes that fail on BOTH clusters leave neither counter incremented, so
+    they cannot be attributed to a specific table here — they are captured by the
+    aggregate zdm_proxy_failed_writes_total{failed_on="both"} metric instead.
+    """
+    if prev_metrics is None:
+        return []
+
+    cur_table = extract_write_success_per_table(metrics)
+    prev_table = extract_write_success_per_table(prev_metrics)
+
+    combos = set()
+    for cluster, ks, tbl in cur_table:
+        combos.add((ks, tbl))
+    for cluster, ks, tbl in prev_table:
+        combos.add((ks, tbl))
+
+    failures = []
+    for ks, tbl in sorted(combos):
+        origin_delta = max(0.0, cur_table.get(("origin", ks, tbl), 0.0)
+                               - prev_table.get(("origin", ks, tbl), 0.0))
+        target_delta = max(0.0, cur_table.get(("target", ks, tbl), 0.0)
+                               - prev_table.get(("target", ks, tbl), 0.0))
+
+        # More origin successes than target successes → target had failures
+        if origin_delta > target_delta:
+            failures.append(("target", ks, tbl, int(origin_delta - target_delta)))
+
+        # More target successes than origin successes → origin had failures
+        elif target_delta > origin_delta:
+            failures.append(("origin", ks, tbl, int(target_delta - origin_delta)))
+
+    return failures
+
+
+def log_write_failures(log_file, failures):
+    """Append per-table write failure entries to the log file.
+
+    Log format per line:
+        YYYY-MM-DD HH:MM:SS UTC  origin|target  keyspace.table  N failed writes
+    """
+    if not log_file or not failures:
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    try:
+        with open(log_file, "a") as f:
+            for side, ks, tbl, count in failures:
+                f.write(f"{ts}  {side}  {ks}.{tbl}  {count} failed writes\n")
+    except OSError as e:
+        print(f"  Failed to write to log file {log_file}: {e}", file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Health checks
 # ---------------------------------------------------------------------------
 
-def check_health(metrics, prev_metrics, config):
+def check_health(metrics, prev_metrics, config, zero_clients_streak=0):
     """Compare current vs previous metrics snapshot. Returns list of (severity, message) tuples."""
     problems = []
 
@@ -116,71 +282,63 @@ def check_health(metrics, prev_metrics, config):
         if d > config["failed_writes_threshold"]:
             problems.append(("warning", f"Failed writes (failed_on={label}): +{int(d)} in last interval (total: {int(cur)})"))
 
-    # Target error types
-    for error_type in ["write_timeout", "unavailable", "overloaded"]:
-        cur = sum_metrics_matching(metrics, "zdm_target_requests_failed_total", f'error="{error_type}"')
-        prev = sum_metrics_matching(prev_metrics, "zdm_target_requests_failed_total", f'error="{error_type}"') if prev_metrics else cur
-        d = delta(cur, prev)
-        if d > config["write_timeout_threshold"]:
-            problems.append(("warning", f"Target {error_type}: +{int(d)} in last interval (total: {int(cur)})"))
+    # Origin write failures — any increase is critical (origin is the source of truth)
+    cur = get_metric(metrics, 'zdm_proxy_failed_writes_total{failed_on="origin"}')
+    prev = get_metric(prev_metrics, 'zdm_proxy_failed_writes_total{failed_on="origin"}') if prev_metrics else cur
+    d = delta(cur, prev)
+    if d > config["failed_origin_writes_threshold"]:
+        problems.append(("critical", f"ORIGIN write failures: +{int(d)} in last interval (total: {int(cur)}) — data may not be reaching Astra"))
 
-    # Origin failures — any at all is critical
-    for error_type in ["write_timeout", "unavailable"]:
-        cur = sum_metrics_matching(metrics, "zdm_origin_requests_failed_total", f'error="{error_type}"')
-        prev = sum_metrics_matching(prev_metrics, "zdm_origin_requests_failed_total", f'error="{error_type}"') if prev_metrics else cur
-        d = delta(cur, prev)
-        if d > 0:
-            problems.append(("critical", f"ORIGIN {error_type}: +{int(d)} in last interval (total: {int(cur)})"))
+    # Target read failures
+    cur = get_metric(metrics, 'zdm_proxy_failed_reads_total{cluster="target"}')
+    prev = get_metric(prev_metrics, 'zdm_proxy_failed_reads_total{cluster="target"}') if prev_metrics else cur
+    d = delta(cur, prev)
+    if d > config["write_timeout_threshold"]:
+        problems.append(("warning", f"Target read failures: +{int(d)} in last interval (total: {int(cur)})"))
+
+    # Origin read failures — any at all is critical
+    cur = get_metric(metrics, 'zdm_proxy_failed_reads_total{cluster="origin"}')
+    prev = get_metric(prev_metrics, 'zdm_proxy_failed_reads_total{cluster="origin"}') if prev_metrics else cur
+    d = delta(cur, prev)
+    if d > 0:
+        problems.append(("critical", f"ORIGIN read failures: +{int(d)} in last interval (total: {int(cur)})"))
 
     # Connection failures
     for cluster in ["origin", "target"]:
-        cur = sum_metrics_matching(metrics, f"zdm_{cluster}_failed_connections_total", "")
-        prev = sum_metrics_matching(prev_metrics, f"zdm_{cluster}_failed_connections_total", "") if prev_metrics else cur
+        cur = get_metric(metrics, f'zdm_proxy_failed_connections_total{{cluster="{cluster}"}}')
+        prev = get_metric(prev_metrics, f'zdm_proxy_failed_connections_total{{cluster="{cluster}"}}') if prev_metrics else cur
         d = delta(cur, prev)
         if d > 3:
             problems.append(("warning", f"{cluster.title()} connection failures: +{int(d)} in last interval"))
 
-    # Per-table write divergence: compare origin vs target successful writes
-    # If origin and target counts differ for a table, data may be diverging
-    write_counts = parse_per_table_writes(metrics)
-    for table_key, counts in write_counts.items():
-        origin_count = counts.get("origin", 0)
-        target_count = counts.get("target", 0)
-        if origin_count > 0 and target_count == 0:
-            problems.append(("critical",
-                f"Write divergence on {table_key}: origin={int(origin_count)} target=0 — target may be down"))
-        elif origin_count != target_count:
-            diff = abs(origin_count - target_count)
-            if diff > config["write_divergence_threshold"]:
-                problems.append(("warning",
-                    f"Write divergence on {table_key}: origin={int(origin_count)} target={int(target_count)} (diff={int(diff)})"))
+    # Zero client connections — sustained absence of clients means the app stopped talking to the proxy
+    if zero_clients_streak >= config["zero_clients_intervals"]:
+        problems.append(("critical",
+            f"No client connections for {zero_clients_streak} consecutive intervals — "
+            f"application may have stopped routing through the proxy"))
 
-    return problems
+    # P99 latency check
+    threshold_s = config["p99_latency_threshold_ms"] / 1000.0
+    for req_type in ["writes", "reads_origin", "reads_target"]:
+        p99 = estimate_p99(metrics, prev_metrics, req_type)
+        if p99 is not None and p99 > threshold_s:
+            problems.append(("warning",
+                f"High p99 latency for {req_type}: {p99 * 1000:.0f}ms "
+                f"(threshold: {config['p99_latency_threshold_ms']}ms)"))
 
+    # Per-table write failures (derived from write success counter divergence)
+    per_table = detect_per_table_write_failures(metrics, prev_metrics)
+    for side, ks, tbl, count in per_table:
+        if side == "origin":
+            severity = "critical"
+            detail = "writes reached target but FAILED on origin — source-of-truth may be losing data"
+        else:
+            severity = "warning"
+            detail = "writes reached origin but FAILED on target — migration target is falling behind"
+        problems.append((severity,
+            f"Per-table write failure on {side}: {ks}.{tbl} +{count} failed writes ({detail})"))
 
-def parse_per_table_writes(metrics):
-    """Parse zdm_proxy_write_success_total metrics into {keyspace.table: {origin: N, target: N}}."""
-    result = {}
-    prefix = "zdm_proxy_write_success_total{"
-    for key, value in metrics.items():
-        if not key.startswith(prefix):
-            continue
-        # Extract labels from key like: zdm_proxy_write_success_total{cluster="origin",keyspace="ks",table="t"}
-        labels_str = key[len(prefix):-1]  # strip prefix and trailing }
-        labels = {}
-        for part in labels_str.split(","):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                labels[k.strip()] = v.strip().strip('"')
-        cluster = labels.get("cluster", "")
-        keyspace = labels.get("keyspace", "")
-        table = labels.get("table", "")
-        if cluster and (keyspace or table):
-            table_key = f"{keyspace}.{table}" if keyspace else table
-            if table_key not in result:
-                result[table_key] = {}
-            result[table_key][cluster] = value
-    return result
+    return problems, per_table
 
 
 # ---------------------------------------------------------------------------
@@ -344,13 +502,22 @@ def main():
                         help="Seconds between checks. 0 = one-shot.")
     parser.add_argument("--failed-writes-threshold", type=int,
                         default=int(os.environ.get("ZDM_FAILED_WRITES_THRESHOLD", "5")),
-                        help="Alert if failed writes increase by more than this per interval")
+                        help="Alert if failed writes (target/both) increase by more than this per interval")
     parser.add_argument("--write-timeout-threshold", type=int,
                         default=int(os.environ.get("ZDM_WRITE_TIMEOUT_THRESHOLD", "5")),
-                        help="Alert if target timeouts increase by more than this per interval")
-    parser.add_argument("--write-divergence-threshold", type=int,
-                        default=int(os.environ.get("ZDM_WRITE_DIVERGENCE_THRESHOLD", "0")),
-                        help="Alert if origin/target per-table write counts differ by more than this")
+                        help="Alert if target read failures increase by more than this per interval")
+    parser.add_argument("--failed-origin-writes-threshold", type=int,
+                        default=int(os.environ.get("ZDM_FAILED_ORIGIN_WRITES_THRESHOLD", "0")),
+                        help="Alert if origin write failures increase by more than this per interval (default: 0)")
+    parser.add_argument("--zero-clients-intervals", type=int,
+                        default=int(os.environ.get("ZDM_ZERO_CLIENTS_INTERVALS", "2")),
+                        help="Alert if client connections stay at 0 for this many consecutive intervals (default: 2)")
+    parser.add_argument("--p99-latency-threshold-ms", type=int,
+                        default=int(os.environ.get("ZDM_P99_LATENCY_THRESHOLD_MS", "500")),
+                        help="Alert if estimated p99 latency exceeds this value in ms (default: 500)")
+    parser.add_argument("--log-file",
+                        default=os.environ.get("ZDM_WRITE_FAILURES_LOG", "zdm-write-failures.log"),
+                        help="Path to per-table write failure log file. Set to empty string to disable.")
 
     # Slack
     parser.add_argument("--slack-webhook-url",
@@ -370,13 +537,20 @@ def main():
     config = {
         "failed_writes_threshold": args.failed_writes_threshold,
         "write_timeout_threshold": args.write_timeout_threshold,
-        "write_divergence_threshold": args.write_divergence_threshold,
+        "failed_origin_writes_threshold": args.failed_origin_writes_threshold,
+        "zero_clients_intervals": args.zero_clients_intervals,
+        "p99_latency_threshold_ms": args.p99_latency_threshold_ms,
     }
+
+    log_file = args.log_file or ""
 
     has_alerting = bool(args.slack_webhook_url or args.pagerduty_routing_key)
     if not has_alerting:
         print("Warning: no alerting configured. Set --slack-webhook-url and/or --pagerduty-routing-key for alerts.",
               file=sys.stderr)
+
+    if log_file:
+        print(f"Per-table write failures will be logged to: {log_file}", file=sys.stderr)
 
     # Clean shutdown on SIGINT/SIGTERM
     def handle_signal(signum, frame):
@@ -388,6 +562,7 @@ def main():
 
     prev_metrics = None
     was_alerting = False
+    zero_clients_streak = 0
 
     while True:
         metrics, err = fetch_metrics(args.metrics_url)
@@ -395,13 +570,26 @@ def main():
         if err:
             print(f"[{now()}] ERROR: {err}", file=sys.stderr)
             problems = [("critical", err)]
+            per_table_failures = []
         else:
+            clients = get_metric(metrics, "zdm_client_connections_total")
+            if clients == 0:
+                zero_clients_streak += 1
+            else:
+                zero_clients_streak = 0
             print_summary(metrics)
-            problems = check_health(metrics, prev_metrics, config)
+            problems, per_table_failures = check_health(metrics, prev_metrics, config, zero_clients_streak)
+
+        if per_table_failures:
+            log_write_failures(log_file, per_table_failures)
+            for side, ks, tbl, count in per_table_failures:
+                print(f"  WRITE FAILURE [{side}]: {ks}.{tbl} +{count} failed writes")
 
         if problems:
             for severity, msg in problems:
-                print(f"  ALERT [{severity}]: {msg}")
+                # Per-table failures are printed above; skip reprinting them here
+                if "Per-table write failure" not in msg:
+                    print(f"  ALERT [{severity}]: {msg}")
             send_slack(args.slack_webhook_url, problems, args.metrics_url)
             send_pagerduty(args.pagerduty_routing_key, args.pagerduty_source, problems, args.metrics_url)
             was_alerting = True

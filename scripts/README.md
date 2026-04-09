@@ -12,7 +12,11 @@ When problems clear, PagerDuty incidents are automatically resolved. Slack alert
 
 ### Monitored metrics and what they mean
 
-**1. Failed writes — `zdm_proxy_failed_writes_total`**
+**1. Metrics endpoint unreachable**
+
+If the script cannot connect to the `/metrics` endpoint at all (proxy down, network issue, wrong port), it immediately fires a **critical** alert to both Slack and PagerDuty. No threshold — any connection failure triggers an alert.
+
+**2. Failed writes — `zdm_proxy_failed_writes_total`**
 
 This counter tracks writes that the proxy could not complete successfully. It has a `failed_on` label indicating which cluster caused the failure.
 
@@ -22,48 +26,72 @@ This counter tracks writes that the proxy could not complete successfully. It ha
 
 *Alert triggers when:* delta > `--failed-writes-threshold` (default: 5) per interval.
 
-**2. Target error breakdown — `zdm_target_requests_failed_total`**
+**3. Origin write failures** (CRITICAL)
 
-Per-node counters with an `error` label giving the specific Cassandra error type. The script monitors:
+Origin is the source of truth. **Any origin failure is critical** — even a single one warrants investigation. The script alerts with no threshold; any non-zero delta fires a critical alert.
 
-- `error="write_timeout"` — Target node accepted the write but couldn't replicate to enough nodes within the timeout. Typically means nodes in the target cluster are slow or down.
-- `error="unavailable"` — Target coordinator knows there aren't enough live replicas to satisfy the consistency level before even attempting the write. Means nodes are down.
-- `error="overloaded"` — Target node is rejecting requests because it's overwhelmed (too many pending requests, compaction backlog, etc).
+*Alert triggers when:* delta > `--failed-origin-writes-threshold` (default: 0, meaning any failure).
 
-*Alert triggers when:* delta > `--write-timeout-threshold` (default: 5) per interval.
+**4. Read failures — `zdm_proxy_failed_reads_total`**
 
-**3. Origin failures — `zdm_origin_requests_failed_total`** (CRITICAL)
+- `cluster="target"` — Target read failures. Monitored against a configurable threshold.
+- `cluster="origin"` — Origin read failures. Any non-zero delta is critical.
 
-Same error types as target, but for origin. **Any origin failure is critical** because origin is the source of truth. The script alerts on any non-zero delta, with no threshold — even a single origin failure warrants investigation.
+*Alert triggers when:* target delta > `--write-timeout-threshold` (default: 5); origin: any increase.
 
-- `error="write_timeout"` — Origin can't replicate writes. Your production database is degraded.
-- `error="unavailable"` — Origin doesn't have enough replicas. Active outage.
+**5. Connection failures — `zdm_proxy_failed_connections_total`**
 
-*Alert triggers when:* any increase at all.
-
-**4. Connection failures — `zdm_{origin,target}_failed_connections_total`**
-
-Tracks failed TCP connection attempts from the proxy to cluster nodes. A spike means the proxy can't reach the cluster — network partition, node crash, or firewall issue. This is a per-node metric summed across all nodes.
+Tracks failed TCP connection attempts from the proxy to cluster nodes. A spike means the proxy can't reach the cluster — network partition, node crash, or firewall issue.
 
 *Alert triggers when:* delta > 3 per interval.
 
-**5. Per-table write divergence — `zdm_proxy_write_success_total`**
+**6. No client connections**
 
-This counter tracks successful writes per cluster, keyspace, and table with labels `{cluster="origin|target", keyspace="...", table="..."}`. The script compares origin and target counts for each table.
+Monitors `zdm_client_connections_total`. If it stays at zero for several consecutive intervals, the application has likely stopped routing through the proxy.
 
-- If origin has writes but target has zero for a table, the target may be completely down for that table — this is **critical**.
-- If origin and target counts differ by more than the threshold, writes are succeeding on origin but failing on target for that table — data is diverging and will need repair after migration.
+*Alert triggers when:* zero connections for `--zero-clients-intervals` consecutive intervals (default: 2).
 
-During normal dual-write operation, origin and target counts should be identical. Any divergence means the target is missing writes.
+**7. P99 latency — `zdm_proxy_request_duration_seconds`**
 
-*Alert triggers when:* origin and target counts differ by more than `--write-divergence-threshold` (default: 0).
+Estimates p99 latency for writes, origin reads, and target reads from histogram buckets. Computes the delta over each interval so a burst of slow requests triggers the alert even if cumulative totals look stable.
+
+*Alert triggers when:* estimated p99 > `--p99-latency-threshold-ms` (default: 500ms).
+
+**8. Per-table write failures — `zdm_proxy_write_success_total`**
+
+This counter tracks successful writes per cluster, keyspace, and table: `{cluster="origin|target", keyspace="...", table="..."}`. The proxy forwards every write to **both** clusters, so under normal operation the origin and target success counts should advance in lockstep.
+
+Each interval, the script computes the delta for each `(keyspace, table)` pair on both clusters and compares them:
+
+- **`origin_delta > target_delta`** — writes reached origin but failed on target for that table. The difference is the number of failed writes. Logged as `target` failure, severity **warning**.
+- **`target_delta > origin_delta`** — writes reached target but failed on origin for that table. The difference is the number of failed writes. Logged as `origin` failure, severity **critical** (source of truth is missing writes).
+
+*Alert triggers when:* any per-table divergence is detected (threshold: any failure).
+
+> **Note:** writes that fail on *both* clusters leave neither counter incremented, so they cannot be attributed to a specific table via this method. They are still caught by the aggregate `zdm_proxy_failed_writes_total{failed_on="both"}` check above.
+
+**Per-table write failure log**
+
+Every per-table failure is appended to a log file (default: `zdm-write-failures.log`). Each line follows this format:
+
+```
+YYYY-MM-DD HH:MM:SS UTC  origin|target  keyspace.table  N failed writes
+```
+
+Example:
+```
+2026-04-09 14:32:01 UTC  target  payments.transactions  3 failed writes
+2026-04-09 14:32:01 UTC  origin  auth.sessions  1 failed writes
+```
+
+Set `--log-file ""` or `ZDM_WRITE_FAILURES_LOG=""` to disable logging.
 
 ### Alert severity levels
 
-| Severity | When | What it means |
-|----------|------|---------------|
-| **critical** | Origin failures, metrics endpoint unreachable, target has zero writes for a table that origin is writing to | Production is impacted right now |
-| **warning** | Target failures, connection problems, origin/target write count divergence | Migration data flow is degraded but origin (source of truth) is fine |
+| Severity | When |
+|----------|------|
+| **critical** | Metrics endpoint unreachable; origin write or read failures; per-table origin write failures |
+| **warning** | Target write/read failures; connection problems; per-table target write failures; high p99 latency; zero clients |
 
 ### Why target failures matter even though origin is fine
 
@@ -89,11 +117,12 @@ python3 zdm-health-check.py \
   --pagerduty-routing-key YOUR_INTEGRATION_KEY_HERE \
   --interval 60
 
-# Both Slack and PagerDuty
+# Both Slack and PagerDuty, with per-table failure log
 python3 zdm-health-check.py \
   --metrics-url http://zdm-proxy-host:14001/metrics \
   --slack-webhook-url https://hooks.slack.com/services/XXX/YYY/ZZZ \
   --pagerduty-routing-key YOUR_INTEGRATION_KEY_HERE \
+  --log-file /var/log/zdm-write-failures.log \
   --interval 60
 ```
 
@@ -105,9 +134,12 @@ Everything can be set via CLI flags or environment variables. CLI flags take pre
 |----------|---------------------|---------|-------------|
 | `--metrics-url` | `ZDM_METRICS_URL` | `http://localhost:14001/metrics` | ZDM proxy Prometheus endpoint |
 | `--interval` | `ZDM_CHECK_INTERVAL` | `0` (one-shot) | Seconds between checks |
-| `--failed-writes-threshold` | `ZDM_FAILED_WRITES_THRESHOLD` | `5` | Alert if failed writes increase by more than this per interval |
-| `--write-timeout-threshold` | `ZDM_WRITE_TIMEOUT_THRESHOLD` | `5` | Alert if target timeouts increase by more than this per interval |
-| `--write-divergence-threshold` | `ZDM_WRITE_DIVERGENCE_THRESHOLD` | `0` | Alert if origin/target per-table write counts differ by more than this |
+| `--failed-writes-threshold` | `ZDM_FAILED_WRITES_THRESHOLD` | `5` | Alert if failed writes (target/both) increase by more than this per interval |
+| `--write-timeout-threshold` | `ZDM_WRITE_TIMEOUT_THRESHOLD` | `5` | Alert if target read failures increase by more than this per interval |
+| `--failed-origin-writes-threshold` | `ZDM_FAILED_ORIGIN_WRITES_THRESHOLD` | `0` | Alert if origin write failures increase by more than this per interval (0 = any failure) |
+| `--zero-clients-intervals` | `ZDM_ZERO_CLIENTS_INTERVALS` | `2` | Alert if client connections stay at 0 for this many consecutive intervals |
+| `--p99-latency-threshold-ms` | `ZDM_P99_LATENCY_THRESHOLD_MS` | `500` | Alert if estimated p99 latency exceeds this value in ms |
+| `--log-file` | `ZDM_WRITE_FAILURES_LOG` | `zdm-write-failures.log` | Path to per-table write failure log file. Set to empty string to disable. |
 | `--slack-webhook-url` | `ZDM_SLACK_WEBHOOK_URL` | *(none)* | Slack incoming webhook URL |
 | `--pagerduty-routing-key` | `ZDM_PAGERDUTY_ROUTING_KEY` | *(none)* | PagerDuty Events API v2 integration/routing key |
 | `--pagerduty-source` | `ZDM_PAGERDUTY_SOURCE` | `zdm-proxy` | Source field in PagerDuty events |
@@ -122,8 +154,8 @@ Everything can be set via CLI flags or environment variables. CLI flags take pre
 The script uses dedup keys based on the metrics URL, so repeated alerts for the same proxy won't create duplicate incidents. When problems clear, the incident is automatically resolved.
 
 Severity mapping:
-- **critical** — origin failures, metrics endpoint unreachable
-- **warning** — target failures, connection problems
+- **critical** — metrics endpoint unreachable, origin write/read failures, per-table origin write failures
+- **warning** — target failures, connection problems, per-table target write failures, high p99 latency
 
 ## Slack setup
 
@@ -144,6 +176,7 @@ Environment=ZDM_METRICS_URL=http://localhost:14001/metrics
 Environment=ZDM_CHECK_INTERVAL=60
 Environment=ZDM_SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
 Environment=ZDM_PAGERDUTY_ROUTING_KEY=your-key-here
+Environment=ZDM_WRITE_FAILURES_LOG=/var/log/zdm-write-failures.log
 ExecStart=/usr/bin/python3 /opt/zdm-proxy/scripts/zdm-health-check.py
 Restart=always
 RestartSec=10
@@ -156,20 +189,29 @@ WantedBy=multi-user.target
 
 Normal operation:
 ```
-[2026-04-03 12:30:00 UTC] OK | clients=42 inflight_writes=3 failed_writes: origin=0 target=0 both=0
-[2026-04-03 12:31:00 UTC] OK | clients=42 inflight_writes=5 failed_writes: origin=0 target=0 both=0
+[2026-04-09 12:30:00 UTC] OK | clients=42 inflight_writes=3 failed_writes: origin=0 target=0 both=0
+[2026-04-09 12:31:00 UTC] OK | clients=42 inflight_writes=5 failed_writes: origin=0 target=0 both=0
 ```
 
-When target starts failing:
+Per-table write failure (target falling behind):
 ```
-[2026-04-03 12:32:00 UTC] OK | clients=42 inflight_writes=2 failed_writes: origin=0 target=12 both=0
-  ALERT [warning]: Failed writes (failed_on=target): +12 in last interval (total: 12)
-  ALERT [warning]: Target write_timeout: +12 in last interval (total: 12)
+[2026-04-09 12:32:00 UTC] OK | clients=42 inflight_writes=2 failed_writes: origin=0 target=0 both=0
+  WRITE FAILURE [target]: payments.transactions +3 failed writes
+  WRITE FAILURE [origin]: auth.sessions +1 failed writes
+  ALERT [warning]: Per-table write failure on target: payments.transactions +3 failed writes (writes reached origin but FAILED on target — migration target is falling behind)
+  ALERT [critical]: Per-table write failure on origin: auth.sessions +1 failed writes (writes reached target but FAILED on origin — source-of-truth may be losing data)
+  PagerDuty alert triggered: zdm-proxy-health-http://localhost:14001/metrics
+```
+
+Metrics endpoint unreachable:
+```
+[2026-04-09 12:33:00 UTC] ERROR: Cannot reach metrics endpoint http://localhost:14001/metrics: <urlopen error [Errno 111] Connection refused>
+  ALERT [critical]: Cannot reach metrics endpoint http://localhost:14001/metrics: ...
   PagerDuty alert triggered: zdm-proxy-health-http://localhost:14001/metrics
 ```
 
 When it recovers:
 ```
-[2026-04-03 12:35:00 UTC] OK | clients=42 inflight_writes=4 failed_writes: origin=0 target=12 both=0
+[2026-04-09 12:35:00 UTC] OK | clients=42 inflight_writes=4 failed_writes: origin=0 target=0 both=0
   PagerDuty incident resolved
 ```
