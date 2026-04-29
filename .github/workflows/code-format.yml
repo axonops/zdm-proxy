@@ -20,27 +20,13 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.ref }}
           repository: ${{ github.event.pull_request.head.repo.full_name }}
-      - name: Install SSH Key
-        if: github.event.pull_request.head.repo.full_name == github.repository
-        uses: shimataro/ssh-key-action@v2
-        with:
-          key: ${{ secrets.SSH_PRIVATE_KEY }} 
-          known_hosts: github.com
       - name: gofmt
-        run: gofmt -s -w .
-      - name: Check for modified files
-        id: git-check
-        run: echo ::set-output name=modified::$(if git diff-index --quiet HEAD --; then echo "false"; else echo "true"; fi)
-      - name: Push changes (non Fork PRs)
-        if: github.event.pull_request.head.repo.full_name == github.repository && steps.git-check.outputs.modified == 'true'
         run: |
-          git config --global user.name 'Auto Gofmt'
-          git config --global user.email 'auto-gofmt@users.noreply.github.com'
-          git remote set-url origin git@github.com:${{ github.repository }}
-          git commit -am "Automated gofmt changes"
-          git push
-      - name: Validate (Fork PRs)
-        if: github.event.pull_request.head.repo.full_name != github.repository && steps.git-check.outputs.modified == 'true'
-        run: |
-          echo "Gofmt code validation failed, please run gofmt on your branch to correctly format your code changes."
-          exit 1
+          unformatted=$(gofmt -s -l .)
+          if [ -n "$unformatted" ]; then
+            echo "Gofmt validation failed. The following files need formatting:"
+            echo "$unformatted"
+            echo ""
+            echo "Run 'gofmt -s -w .' locally and commit the result."
+            exit 1
+          fi
